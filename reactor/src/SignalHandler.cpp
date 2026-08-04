@@ -10,6 +10,11 @@ SignalHandler::SignalHandler(EventLoop* loop)
         : eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))  // 创建 eventfd + Channel
         , channel_(eventfd_, loop)
 {
+    // 忽略 SIGPIPE：客户端中途断开时，sendfile()/send() 会触发 SIGPIPE，
+    // 默认动作是终止整个进程（服务器"自动关闭"）。忽略后 syscall 返回
+    // EPIPE，由 handleClose() 正常清理该连接。
+    ::signal(SIGPIPE, SIG_IGN);
+
     instance_ = this;  // 设置全局单例指针，供C信号处理函数使用
     channel_.setReadCallback(std::bind(&SignalHandler::handleRead, this)); // 设置可读事件的回调函数
     channel_.enableReading(); // 使能可读事件

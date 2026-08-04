@@ -76,14 +76,26 @@ void HttpResponse::appendToBuffer(Buffer* buf) const// 序列化成 HTTP 响应�
     buf->append("\r\n", 2);
     
     //序列化Body
-    buf->append(body_.data(), body_.size());
+    if(!isFileBody_){
+        buf->append(body_.data(), body_.size());
+    }
 }
 
 std::string HttpResponse::toString() const// 将响应对象转换为字符串形式
 {
+    std::string result = headersToString();
+    if(!isFileBody_){
+        result += body_;
+    }
+
+    return result;
+}
+
+std::string HttpResponse::headersToString() const // 将响应头部转换为字符串形式
+{
     std::string result;
     // 预估大小，减少 realloc
-    size_t estimate = 64 + statusMessage_.size() + body_.size();
+    size_t estimate = 64 + statusMessage_.size();
     for (auto& [k, v] : headers_) estimate += k.size() + v.size() + 4;
     result.reserve(estimate);
 
@@ -93,10 +105,12 @@ std::string HttpResponse::toString() const// 将响应对象转换为字符串�
     for (auto& [k, v] : headers_) {
         result += k + ": " + v + "\r\n";
     }
+    // HTTP/1.0 短连接或错误响应：发送后关闭连接
+    if (closeConnection_) {
+        result += "Connection: close\r\n";
+    }
     // 空行
     result += "\r\n";
-    // Body
-    result += body_;
 
     return result;
 }
@@ -114,4 +128,26 @@ HttpResponse HttpResponse::makeError(HttpResponse::HttpStatusCode code, const st
     response.closeConnection_ = true; // 错误响应通常会关闭连接
 
     return response;
+}
+
+void HttpResponse::setFileBody(const std::string& filepath, off_t size) // 设置文件作为响应体
+{
+    isFileBody_ = true;
+    fileBodyPath_ = filepath;
+    fileBodySize_ = size;
+}
+
+bool HttpResponse::isFileBody() const // 判断是否使用文件作为响应体
+{
+    return isFileBody_;
+}
+
+const std::string& HttpResponse::fileBodyPath() const // 获取文件路径
+{
+    return fileBodyPath_;
+}
+
+off_t HttpResponse::fileBodySize() const // 获取文件大小
+{
+    return fileBodySize_;
 }

@@ -27,10 +27,20 @@ public:
 
     void appendToBuffer(Buffer* buf) const;// 序列化成 HTTP 响应报文
     std::string toString() const;// 将响应对象转换为字符串形式
+    std::string headersToString() const; // 将响应头部转换为字符串形式
+
+    void setFileBody(const std::string& filepath, off_t size); // 设置文件作为响应体
+    bool isFileBody() const; // 判断是否使用文件作为响应体
+    const std::string& fileBodyPath() const; // 获取文件路径
+    off_t fileBodySize() const; // 获取文件大小
+
 private:
     HttpStatusCode statusCode_;// 状态码
     std::string statusMessage_;// 状态消息
     std::string body_;// 主体内容
 	std::map<std::string, std::string> headers_;
 	bool closeConnection_;
+    bool isFileBody_ = false; // 标记是否使用文件作为响应体
+    std::string fileBodyPath_; // 文件路径
+    off_t fileBodySize_ = 0; // 文件大小
 };

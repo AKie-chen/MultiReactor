@@ -1,5 +1,6 @@
 #include "EventLoopThread.h"
 #include <pthread.h>
+#include <memory>
 
 EventLoopThread::EventLoopThread()
 {
@@ -20,11 +21,11 @@ EventLoop* EventLoopThread::getLoop() const   // 返回 loop 指针
 
 void EventLoopThread::threadFunc()            // 线程函数：创建 loop → loop.loop()
 {
-    EventLoop loop; // 创建事件循环对象
+    auto loop = std::make_unique<EventLoop>(); // 创建事件循环对象
     {
         std::lock_guard<std::mutex> lock(mutex_); // 加锁，保护共享数据loop_
-        loop_ = &loop; // 将loop_指针指向事件循环对象
+        loop_ = loop.get(); // 将loop_指针指向事件循环对象
     }
     cond_.notify_one(); // 通知等待的线程，loop_已被初始化
-    loop.loop(); // 进入事件循环，开始处理事件
+    loop->loop(); // 进入事件循环，开始处理事件
 }
