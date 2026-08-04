@@ -1,6 +1,40 @@
 #include "HttpContext.h"
 #include<algorithm>
+#include<sstream>
+#include<iomanip>
 #include<cstring>
+#include<error.h>
+
+// url解码函数，将%xx转为对应字符
+static std::string urlDecode(const std::string& src)
+{
+    std::string dest;
+    dest.clear();
+    dest.reserve(src.size());
+
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (src[i] == '%') {
+            if (i + 2 < src.size()) {
+                int value = 0;
+                std::istringstream is(src.substr(i + 1, 2));
+                if (is >> std::hex >> value) {
+                    dest += static_cast<char>(value);
+                    i += 2;
+                } else {
+                    dest += '%';
+                }
+            } else {
+                dest += '%';
+            }
+        } else if (src[i] == '+') {
+            dest += ' ';
+        } else {
+            dest += src[i];
+        }
+    }
+
+    return dest;
+}
 
 HttpContext::HttpContext():state_(kExpectRequestLine)
                           , contentLength_(0)
@@ -21,15 +55,16 @@ int HttpContext::findCrlf(Buffer* buf, const char* cl ,std::string& line)//查�
     return 0;
 }
 
-//返回true = 完整请求解析到req
+//返回true = 完整请求解析完成（数据在 request_ 中）
 //返回false = 数据不够，等待更多数据（下次EPOLLIN继续）
-bool HttpContext::parseRequest(Buffer* buf, HttpRequest* req)
+//解析结果累积到内部 request_ 成员，跨多次调用保留（TCP拆包时请求行信息不丢失）
+bool HttpContext::parseRequest(Buffer* buf)
 {
     if(state_ == kExpectRequestLine){
         std::string line;
         if(findCrlf(buf,"\r\n", line) < 0) return false;//数据不够
 
-        if (!parseRequestLine(line, req)) return false;  // 格式错误
+        if (!parseRequestLine(line, &request_)) return false;  // 格式错误
 
         state_ = kExpectHeaders;
     }
@@ -39,7 +74,7 @@ bool HttpContext::parseRequest(Buffer* buf, HttpRequest* req)
             std::string line;
             if(findCrlf(buf,"\r\n", line) < 0) return false;
             if(line.empty()) break;
-            if(!parseHeader(line, req)) return false;
+            if(!parseHeader(line, &request_)) return false;
         }
 
         state_ = (contentLength_ > 0) ? kExpectBody : KGotCompleteRequest;
@@ -47,7 +82,7 @@ bool HttpContext::parseRequest(Buffer* buf, HttpRequest* req)
 
     if(state_ == kExpectBody){
         if (buf->readableBytes() < contentLength_) return false;  // 数据不够
-        req->setBody(buf->retrieve(contentLength_));
+        request_.setBody(buf->retrieve(contentLength_));
         state_ = KGotCompleteRequest;
     }
 
@@ -58,6 +93,7 @@ void HttpContext::reset()//一个请求处理完，复位等待下一个
 {
     state_ = kExpectRequestLine;
     contentLength_ = 0;
+    request_ = HttpRequest();  // 清空上一个请求的解析数据
 }
 
 bool HttpContext::parseRequestLine(std::string& line, HttpRequest* req)
@@ -80,7 +116,16 @@ bool HttpContext::parseRequestLine(std::string& line, HttpRequest* req)
 
     std::string path = line.substr(sp1 + 1, sp2 - sp1 - 1);//设置路径
     if(!path.empty()) {
-        req->setPath(path);
+        req->setRawPath(path);  // 原始路径（解码前）
+
+        size_t queryPos = path.find('?');
+        if (queryPos != std::string::npos) {
+            req->setQuery(path.substr(queryPos + 1));
+            req->setPath(urlDecode(path.substr(0, queryPos)));
+        } else {
+            req->setQuery("");
+            req->setPath(urlDecode(path));
+        }
     }else{
         error_ = kBadRequest;
         return false;
@@ -111,7 +156,15 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
     std::string value = line.substr(valBegin);
 
     req->addHeader(key, value);
-    if (key == "Content-Length") contentLength_ = std::stoul(value);
+    if (key == "Content-Length"){
+        try{
+            contentLength_ = std::stoul(value);
+        }catch(const std::exception& e){
+            error_ = kBadRequest;
+            return false;
+        }
+    }
+        
 
     return true;
 }

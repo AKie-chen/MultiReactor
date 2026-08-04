@@ -39,7 +39,7 @@ int main(int argc, char* argv[]) {
     });
 
     Router router;
-    StaticFileHandler staticHandler(cfg.staticDir);
+    StaticFileHandler staticHandler(cfg.staticDir, cfg.maxFileSizeMB * 1024 * 1024);
 
     router.addRoute(HttpRequest::kGet, "/", [](const HttpRequest& req, HttpResponse* resp) {
         resp->setStatusCode(HttpResponse::k200Ok);
@@ -90,45 +90,42 @@ int main(int argc, char* argv[]) {
     server.setMessageCallback([&resetTimer, &threadPool, &router, &staticHandler]
                               (TcpConnection::ptr conn, Buffer* buf) {
         HttpContext& ctx = conn->context();
-        HttpRequest req;
 
-        if (!ctx.parseRequest(buf, &req)) {
-            if (ctx.error() == HttpContext::kNoError) return;
-            else if (ctx.error() == HttpContext::kBadRequest) {
+        // 解析请求（解析状态累积在 ctx 内部，TCP 拆包时多次 EPOLLIN 之间不丢失）
+        if (!ctx.parseRequest(buf)) {
+            if (ctx.error() == HttpContext::kNoError) return; // 请求不完整，继续等待
+            else if (ctx.error() == HttpContext::kBadRequest) { // 400 Bad Request
                 Metrics::instance().errors4xx++;
-                conn->getLoop()->queueInLoop([conn]() {
-                    conn->send(HttpResponse::makeError(
-                        HttpResponse::k400BadRequest, "Bad Request").toString());
-                });
-                conn->forceClose();
+                conn->send(HttpResponse::makeError(
+                    HttpResponse::k400BadRequest, "Bad Request").toString());
+                conn->markForClose();
                 return;
-            } else if (ctx.error() == HttpContext::kMethodNotSupported) {
+            } else if (ctx.error() == HttpContext::kMethodNotSupported) { // 405 Method Not Allowed
                 Metrics::instance().errors4xx++;
-                conn->getLoop()->queueInLoop([conn]() {
-                    conn->send(HttpResponse::makeError(
-                        HttpResponse::k405MethodNotAllowed,
-                        "Method Not Supported").toString());
-                });
+                conn->send(HttpResponse::makeError(
+                    HttpResponse::k405MethodNotAllowed,
+                    "Method Not Supported").toString());
+                conn->markForClose();
                 ctx.reset();
                 return;
-            } else if (ctx.error() == HttpContext::kVersionNotSupported) {
+            } else if (ctx.error() == HttpContext::kVersionNotSupported) { // 505 HTTP Version Not Supported
                 Metrics::instance().errors5xx++;
-                conn->getLoop()->queueInLoop([conn]() {
-                    conn->send(HttpResponse::makeError(
-                        HttpResponse::k505HttpVersionNotSupported,
-                        "Http Version Not Supported").toString());
-                });
+                conn->send(HttpResponse::makeError(
+                    HttpResponse::k505HttpVersionNotSupported,
+                    "Http Version Not Supported").toString());
+                conn->markForClose();
                 ctx.reset();
                 return;
             }
         }
 
-        // 处理完复位，等待下一个请求
+        // 取出解析结果，处理完复位，等待下一个请求
+        HttpRequest req = ctx.request();
         ctx.reset();
         Metrics::instance().totalRequests++;
         resetTimer(conn);
 
-        threadPool.run([conn, req, &router, &staticHandler]() {
+        bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler]() {
             HttpResponse resp;
             if (!router.route(req, &resp)) {
                 if (!staticHandler.handle(req, &resp)) {
@@ -140,11 +137,33 @@ int main(int argc, char* argv[]) {
             if (code >= 400 && code < 500) Metrics::instance().errors4xx++;
             else if (code >= 500) Metrics::instance().errors5xx++;
 
-            std::string data = resp.toString();
-            conn->getLoop()->queueInLoop([conn, data = std::move(data)]() {
-                conn->send(data);
+            // HTTP/1.0 默认短连接：响应发送完毕后关闭连接
+            bool closeConn = resp.closeConnection();
+            if (req.version() == "HTTP/1.0" && !closeConn) {
+                closeConn = true;
+                resp.setCloseConnection(true);
+            }
+
+            conn->getLoop()->queueInLoop([conn, resp, closeConn]() {
+                if(resp.isFileBody()){
+                    conn->sendResponse(resp);
+                } else {
+                    conn->send(resp.toString());
+                }
+                if (closeConn) conn->markForClose();
             });
         });
+
+        if(!submitted) {
+            // 队列满 → 主线程直接处理，或返回 503
+            HttpResponse resp = HttpResponse::makeError(
+                HttpResponse::k500InternalServerError,  // 或自定义 503
+                "Server busy, please retry later"
+            );
+            conn->getLoop()->queueInLoop([conn, data = resp.toString()]() {
+            conn->send(data);
+            });
+        }
     });
 
     server.setMaxConnections(cfg.maxConnections);

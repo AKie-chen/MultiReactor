@@ -24,10 +24,18 @@ public:
     void setBody(const std::string& body);//设置数据
     const std::string& body() const;//获取数据
 
+    void setQuery(const std::string& query);//设置查询参数
+    const std::string& query() const;//获取查询参数
+
+    void setRawPath(const std::string& raw);  // 原始路径（解码前）
+    const std::string& rawPath() const;// 获取原始路径（解码前）
+
 private:   
     Method method_ = kInvalid;//http方法
     std::string path_;//url路径
     std::string version_;//http版本
     std::map<std::string, std::string> headers_;//头部数据
     std::string body_;//数据
+    std::string query_;     // 查询参数
+    std::string rawPath_;   // 原始未解码路径
 };

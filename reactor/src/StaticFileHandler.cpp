@@ -6,7 +6,8 @@
 #include <sys/stat.h>
 
 
-StaticFileHandler::StaticFileHandler(const std::string& rootDir) : rootDir_(rootDir), enabled_(false) {
+StaticFileHandler::StaticFileHandler(const std::string& rootDir, size_t maxFileSizeBytes)
+    : rootDir_(rootDir), maxFileSizeBytes_(maxFileSizeBytes), enabled_(false) {
     if (rootDir_[rootDir_.length() - 1] != '/') {
         rootDir_ += '/';
     }
@@ -62,33 +63,32 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
         }
 
         if (stat(indexResolved, &st) != 0) return false; // 判断 index.html 是否存在
-        if (st.st_size > 10 * 1024 * 1024) {
+        if (st.st_size > maxFileSizeBytes_) {
             *resp = HttpResponse::makeError(HttpResponse::k413PayloadTooLarge, "Payload Too Large");
             return true;
         }
 
-        std::string context = readFile(indexResolved);
-        resp->setBody(context);
+        // 4. 设置文件作为响应体
+        resp->setFileBody(indexResolved, st.st_size);
         resp->setStatusCode(HttpResponse::k200Ok);
-        resp->setStatusMessage("OK");
-        resp->addHeader("Content-Type", getMimeType("index.html"));
-        resp->addHeader("Content-Length", std::to_string(context.size()));
+        resp->addHeader("Content-Type", getMimeType(indexResolved)); // 用实际文件(index.html)判定 MIME，目录路径无扩展名
+        resp->addHeader("Content-Length", std::to_string(st.st_size));
+
         return true;
     }
 
     // 4. 检查文件大小
-    if (st.st_size > 10 * 1024 * 1024) {
+    if (st.st_size > maxFileSizeBytes_) {
         *resp = HttpResponse::makeError(HttpResponse::k413PayloadTooLarge, "Payload Too Large");
         return true;
     }
 
     // 5. 读取并返回（空文件 = 200 OK + 空 body）
-    std::string context = readFile(resolved);
-    resp->setBody(context);
+    resp->setFileBody(resolved, st.st_size);
     resp->setStatusCode(HttpResponse::k200Ok);
     resp->setStatusMessage("OK");
     resp->addHeader("Content-Type", getMimeType(req.path()));
-    resp->addHeader("Content-Length", std::to_string(context.size()));
+    resp->addHeader("Content-Length", std::to_string(st.st_size));
     return true;
 }
 
@@ -121,8 +121,8 @@ std::string StaticFileHandler::readFile(const std::string& filepath)  // 读文�
     // 文件大小检查
     file.seekg(0, std::ios::end);
     long long size = file.tellg();
-    if(size > 10*1024*1024) {
-        LOG_DEBUG << "File size exceeds 10MB: " << filepath;
+    if(size > maxFileSizeBytes_){
+        LOG_DEBUG << "File size exceeds limit: " << filepath;
         return "";
     }
     file.seekg(0, std::ios::beg); // 回到文件开头

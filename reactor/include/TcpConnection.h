@@ -3,10 +3,13 @@
 #include "Buffer.h"
 #include "Timer.h"
 #include "HttpContext.h"
+#include "HttpResponse.h"
 #include <string>
 #include <functional>
 #include <memory>
 #include <atomic>
+#include <queue>
+
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
@@ -15,12 +18,16 @@ public:
     using ConnectionCallback = std::function<void(ptr)>;
     using MessageCallback = std::function<void(ptr, Buffer*)>;
     using CloseCallback = std::function<void(ptr)>;
-
+    
     TcpConnection(int fd, EventLoop* loop);
     ~TcpConnection();
+    
+    void send(const std::string& data); // 发送数据，非阻塞，可能会分多次发送
+    void sendFile(const std::string& headers, const std::string& filepath, off_t size); // 发送文件，非阻塞，可能会分多次发送
+    void sendResponse(const HttpResponse& resp); // 根据isFileBody_选择发送方式
 
-    void send(const std::string& data);
     void forceClose();
+    void markForClose() { closeAfterSend_ = true; }  // 发送队列清空后关闭连接（HTTP/1.0 短连接）
     void connectEstablished();
     void setMessageCallback(const MessageCallback& cb);
     void setConnectionCallback(const ConnectionCallback& cb);
@@ -51,4 +58,18 @@ private:
     MessageCallback messageCallback_;
     CloseCallback closeCallback_;
     std::function<void()> onDestroy_;
+
+    struct SendItem {
+        std::string headers;    // 响应头
+        std::string filePath;   // 文件路径（为空 = 纯内存发送）
+        int fileFd = -1;         // 文件描述符（sendfile使用）
+        off_t fileOffset = 0;   // sendfile偏移
+        off_t fileSize = 0;
+
+        bool isFile() const { return !filePath.empty(); }
+    };
+
+    std::queue<SendItem> sendQueue_;  // 发送队列，保证顺序发送
+    bool sending_ = false;  // 是否正在发送中，防止重复调用 handleWrite()
+    bool closeAfterSend_ = false;  // 队列清空后关闭连接
 };

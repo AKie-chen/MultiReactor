@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
 
 TcpConnection::TcpConnection(int fd, EventLoop* loop)
     : fd_(fd), loop_(loop), channel_(fd, loop)
@@ -22,22 +24,26 @@ TcpConnection::~TcpConnection()
 void TcpConnection::send(const std::string& data)
 {
     Metrics::instance().bytesSent += data.size();
-    if (outputBuffer_.readableBytes() == 0) {
-        ssize_t n = ::send(fd_, data.data(), data.size(), MSG_NOSIGNAL);
-        if (n > 0) {
-            if (static_cast<size_t>(n) == data.size()) return;
-            outputBuffer_.append(data.data() + n, data.size() - n);
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            outputBuffer_.append(data.data(), data.size());
-        } else {
-            handleClose();
-            return;
-        }
-    } else {
-        outputBuffer_.append(data.data(), data.size());
+    sendQueue_.push({data, "", -1, 0, 0}); // 纯内存SendItem
+    if(!sending_){
+        sending_ = true;
+        channel_.enableWriting();
+    }
+}
+
+void TcpConnection::sendFile(const std::string& headers,const std::string& filepath, off_t size)
+{
+    Metrics::instance().bytesSent += size;
+    int fd = ::open(filepath.c_str(), O_RDONLY);
+    if (fd < 0) {
+        handleClose();
         return;
     }
-    channel_.enableWriting();
+    sendQueue_.push({headers, filepath, fd, 0, size});  // headers+文件
+    if (!sending_) {
+        sending_ = true;
+        channel_.enableWriting();
+    }
 }
 
 void TcpConnection::forceClose()
@@ -92,8 +98,13 @@ void TcpConnection::handleRead()
     size_t received = inputBuffer_.readableBytes() - before;
     if (received > 0) Metrics::instance().bytesReceived += received;
 
-    if (inputBuffer_.readableBytes() > 0) {
+    // ET 模式：一次 EPOLLIN 可能读到多个请求（keep-alive/pipelining），
+    // 必须循环消费 buffer 中所有完整请求，否则剩余请求永远等不到新的 EPOLLIN
+    while (inputBuffer_.readableBytes() > 0 && !closed_) {
+        size_t oldLen = inputBuffer_.readableBytes();
         messageCallback_(shared_from_this(), &inputBuffer_);
+        // parseRequest 没消费任何数据 = 请求不完整，等更多数据（下次 EPOLLIN）
+        if (inputBuffer_.readableBytes() >= oldLen) break;
     }
 
     if (result == Buffer::kClosed) {
@@ -105,12 +116,55 @@ void TcpConnection::handleRead()
 
 void TcpConnection::handleWrite()
 {
-    Buffer::ReadResult result = outputBuffer_.writeFd(fd_);
-    if (outputBuffer_.readableBytes() == 0) {
-        channel_.disableWriting();
-        outputBuffer_.shrinkIfLarge();
+    while (!sendQueue_.empty()) {
+        SendItem& item = sendQueue_.front();
+
+        // 先发内存部分（headers）
+        if (!item.headers.empty()) {
+            ssize_t n = ::send(fd_, item.headers.data(),
+                               item.headers.size(), MSG_NOSIGNAL);
+            if (n > 0) {
+                item.headers.erase(0, n);
+                if (!item.headers.empty()) return;  // 没发完，等下次 EPOLLOUT
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            } else {
+                handleClose();
+                return;
+            }
+        }
+        // headers 发完，再发文件部分
+        else if (item.isFile()) {
+            // 空文件（0 字节）：跳过 sendfile，直接结束本项。
+            // sendfile 对 count=0 返回 0，会误落入 errno 错误分支导致误关连接
+            if (item.fileOffset >= item.fileSize) {
+                ::close(item.fileFd);
+                sendQueue_.pop();
+                continue;
+            }
+            ssize_t n = ::sendfile(fd_, item.fileFd, &item.fileOffset,
+                                   item.fileSize - item.fileOffset);
+            if (n > 0) {
+                if (item.fileOffset < item.fileSize) return;  // 没发完
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            } else {
+                handleClose();
+                return;
+            }
+            // 文件发完，关闭 fd
+            ::close(item.fileFd);
+            sendQueue_.pop();
+        }
+        else {
+            sendQueue_.pop();  // 纯内存且 headers 已空
+        }
     }
-    if (result == Buffer::kError) {
+    // 队列空 → 关闭写事件
+    sending_ = false;
+    channel_.disableWriting();
+    // 短连接（HTTP/1.0）：所有数据发送完毕后关闭连接
+    if (closeAfterSend_) {
         handleClose();
     }
 }
@@ -126,6 +180,14 @@ void TcpConnection::handleClose()
     ptr guard = shared_from_this();
 
     LOG_DEBUG << "Connection closing, fd=" << fd_;
+
+    // 清理发送队列中未发送完的文件 fd，防止 fd 泄漏
+    // （客户端中途断开时，SendItem 里的 open fd 不会走正常 handleWrite 关闭）
+    while (!sendQueue_.empty()) {
+        if (sendQueue_.front().fileFd >= 0) ::close(sendQueue_.front().fileFd);
+        sendQueue_.pop();
+    }
+
     if (onDestroy_) onDestroy_();
     if (closeCallback_) closeCallback_(guard);
     destroy();
@@ -142,4 +204,13 @@ void TcpConnection::destroy()
     loop_->queueInLoop([guard = shared_from_this()]() {
         // guard 在此销毁，TcpConnection 生命周期安全结束
     });
+}
+
+void TcpConnection::sendResponse(const HttpResponse& resp) // 根据isFileBody_选择发送方式
+{
+    if (resp.isFileBody()) {
+        sendFile(resp.headersToString(), resp.fileBodyPath(), resp.fileBodySize());
+    } else {
+        send(resp.toString());
+    }
 }

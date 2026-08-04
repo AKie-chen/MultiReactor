@@ -55,3 +55,23 @@ const std::string& HttpRequest::body() const//获取数据
 {
     return body_;
 }
+
+void HttpRequest::setQuery(const std::string& query)//设置查询参数
+{
+    query_ = query;
+}
+
+const std::string& HttpRequest::query() const//获取查询参数
+{
+    return query_;
+}
+
+void HttpRequest::setRawPath(const std::string& raw)//设置原始路径
+{
+    rawPath_ = raw;
+}
+
+const std::string& HttpRequest::rawPath() const//获取原始路径
+{
+    return rawPath_;
+}
