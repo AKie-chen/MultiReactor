@@ -34,6 +34,7 @@ bool ThreadPool::tryRun(Task task)//提交任务，非阻塞
 
 size_t ThreadPool::queueSize() const // 获取当前任务队列大小
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     return tasks_.size();
 }
 

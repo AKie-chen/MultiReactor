@@ -38,6 +38,8 @@ bool ConfigParser::parse(int argc, char* argv[], ServerConfig& cfg)
             if (i + 1 < argc) cfg.connectionTimeoutSec = std::atoi(argv[++i]);
         } else if (arg == "--log-level") {
             if (i + 1 < argc) cfg.logLevel = argv[++i];
+        } else if (arg == "--max-queue-size") {
+            if (i + 1 < argc) cfg.maxQueueSize = std::atoi(argv[++i]);
         } else {
             LOG_ERROR << "Unknown argument: " << arg;
             return false;
@@ -90,6 +92,10 @@ bool ConfigParser::loadFromFile(const std::string& filepath, ServerConfig& cfg)
             cfg.staticDir = value;
         } else if(key == "max_file_size") {
             cfg.maxFileSizeMB = std::atoi(value.c_str());
+        }else if(key == "max_queue_size") {
+            cfg.maxQueueSize = std::atoi(value.c_str());
+        } else {
+            LOG_WARN << "Unknown config key: " << key;
         }
     }
 
@@ -108,5 +114,6 @@ void ConfigParser::printHelp(const char* program)
          << "  -i, --io  Specify the number of IO threads" << std::endl
          << "  -w, --worker  Specify the number of worker threads" << std::endl
          << "  -d, --static-dir <dir>  Specify the directory for static files" << std::endl
-         << "  -m, --max-file-size <size>  Specify the maximum file size in MB" << std::endl;
+         << "  -m, --max-file-size <size>  Specify the maximum file size in MB" << std::endl
+         << "  --max-queue-size <size>  Specify the maximum queue size for the thread pool" << std::endl;
 }

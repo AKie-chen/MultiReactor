@@ -38,7 +38,9 @@ void HttpRequest::addHeader(const std::string& key, const std::string& value)//�
 std::string HttpRequest::getHeader(const std::string& key) const//获取头
 {
     auto it = headers_.find(key);
-    return it->second;
+    // 找不到必须返回空串：直接解引用 end() 是未定义行为，
+    // 会从垃圾指针构造 string 导致 bad_alloc 崩溃（If-Modified-Since 场景实测）
+    return it != headers_.end() ? it->second : std::string();
 }
 
 const std::map<std::string, std::string>& HttpRequest::headers() const//获取头部哈希

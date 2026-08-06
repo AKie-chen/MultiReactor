@@ -27,7 +27,7 @@ int main(int argc, char* argv[]) {
     Logger::setLevel(LogLevel(Logger::parseLogLevel(cfg.logLevel)));
     EventLoop loop;
     TcpServer server(&loop, cfg.port, cfg.ioThreads);
-    ThreadPool threadPool(cfg.workerThreads);
+    ThreadPool threadPool(cfg.workerThreads, cfg.maxQueueSize);
 
     SignalHandler signalHandler(&loop);
     signalHandler.addSignal(SIGINT);
@@ -41,7 +41,7 @@ int main(int argc, char* argv[]) {
     Router router;
     StaticFileHandler staticHandler(cfg.staticDir, cfg.maxFileSizeMB * 1024 * 1024);
 
-    router.addRoute(HttpRequest::kGet, "/", [](const HttpRequest& req, HttpResponse* resp) {
+    router.addRoute(HttpRequest::kGet, "/", [](const HttpRequest& req, HttpResponse* resp, const std::map<std::string, std::string>& params) {
         resp->setStatusCode(HttpResponse::k200Ok);
         resp->setStatusMessage("OK");
         resp->setBody("Hello, World!");
@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
         resp->addHeader("Content-Type", "text/plain");
     });
 
-    router.addRoute(HttpRequest::kGet, "/stats", [](const HttpRequest&, HttpResponse* resp) {
+    router.addRoute(HttpRequest::kGet, "/stats", [](const HttpRequest&, HttpResponse* resp, const std::map<std::string, std::string>& params) {
         std::string json = Metrics::instance().toJson();
         resp->setStatusCode(HttpResponse::k200Ok);
         resp->setStatusMessage("OK");
@@ -57,6 +57,15 @@ int main(int argc, char* argv[]) {
         resp->addHeader("Content-Type", "application/json");
         resp->addHeader("Content-Length", std::to_string(json.size()));
     });
+
+    router.addRoute(HttpRequest::kGet, "/user/:id", [](const HttpRequest&, HttpResponse* resp, const std::map<std::string, std::string>& params) {
+        std::string body = "user id: " + params.at("id");
+        resp->setStatusCode(HttpResponse::k200Ok);
+        resp->setBody(body);
+        resp->addHeader("Content-Length", std::to_string(body.size()));
+        resp->addHeader("Content-Type", "text/plain");
+    });
+
 
     auto resetTimer = [&cfg](TcpConnection::ptr conn) {
         if (conn->timerId() != 0) {
@@ -99,6 +108,7 @@ int main(int argc, char* argv[]) {
                 conn->send(HttpResponse::makeError(
                     HttpResponse::k400BadRequest, "Bad Request").toString());
                 conn->markForClose();
+                ctx.reset();
                 return;
             } else if (ctx.error() == HttpContext::kMethodNotSupported) { // 405 Method Not Allowed
                 Metrics::instance().errors4xx++;
@@ -127,12 +137,18 @@ int main(int argc, char* argv[]) {
 
         bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler]() {
             HttpResponse resp;
-            if (!router.route(req, &resp)) {
+
+            // 处理路由
+            std::map<std::string, std::string> params;
+            auto result = router.route(req, &resp, &params);
+            if (result == RouterResult::kNotFound) {
                 if (!staticHandler.handle(req, &resp)) {
-                    resp = HttpResponse::makeError(
-                        HttpResponse::k404NotFound, "Not Found");
+                resp = HttpResponse::makeError(HttpResponse::k404NotFound, "Not Found");
                 }
+            } else if (result == RouterResult::kMethodNotAllowed) {
+                resp = HttpResponse::makeError(HttpResponse::k405MethodNotAllowed, "Method Not Allowed");
             }
+
             int code = static_cast<int>(resp.code());
             if (code >= 400 && code < 500) Metrics::instance().errors4xx++;
             else if (code >= 500) Metrics::instance().errors5xx++;
@@ -155,13 +171,16 @@ int main(int argc, char* argv[]) {
         });
 
         if(!submitted) {
-            // 队列满 → 主线程直接处理，或返回 503
+            // 队列满 → 背压：返回 503 Service Unavailable
+            // makeError 自动带 "Connection: close" 头，发送后真正关闭连接
             HttpResponse resp = HttpResponse::makeError(
-                HttpResponse::k500InternalServerError,  // 或自定义 503
-                "Server busy, please retry later"
+                HttpResponse::k503ServiceUnavailable,
+                "Server Busy, please retry later"
             );
+            Metrics::instance().errors5xx++;
             conn->getLoop()->queueInLoop([conn, data = resp.toString()]() {
-            conn->send(data);
+                conn->send(data);
+                conn->markForClose();
             });
         }
     });

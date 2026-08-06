@@ -1,9 +1,15 @@
 #include "HttpContext.h"
 #include<algorithm>
-#include<sstream>
 #include<iomanip>
 #include<cstring>
 #include<error.h>
+
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1; // Invalid hex character
+}
 
 // url解码函数，将%xx转为对应字符
 static std::string urlDecode(const std::string& src)
@@ -16,13 +22,11 @@ static std::string urlDecode(const std::string& src)
         if (src[i] == '%') {
             if (i + 2 < src.size()) {
                 int value = 0;
-                std::istringstream is(src.substr(i + 1, 2));
-                if (is >> std::hex >> value) {
-                    dest += static_cast<char>(value);
-                    i += 2;
-                } else {
-                    dest += '%';
-                }
+                int hi = hexVal(src[i + 1]);
+                int lo = hexVal(src[i + 2]);
+                value = (hi << 4) | lo;
+                dest += static_cast<char>(value);
+                i += 2;
             } else {
                 dest += '%';
             }

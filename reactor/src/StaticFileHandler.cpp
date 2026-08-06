@@ -3,8 +3,8 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <cstring>
 #include <sys/stat.h>
-
 
 StaticFileHandler::StaticFileHandler(const std::string& rootDir, size_t maxFileSizeBytes)
     : rootDir_(rootDir), maxFileSizeBytes_(maxFileSizeBytes), enabled_(false) {
@@ -22,8 +22,34 @@ StaticFileHandler::StaticFileHandler(const std::string& rootDir, size_t maxFileS
 }
 
 bool StaticFileHandler::isWithinRoot(const char* resolved) const {
-    std::string resolvedStr(resolved);
-    return resolvedStr.rfind(rootDirAbs_, 0) == 0;
+    if(strcmp(resolved, rootDirAbs_) == 0) return true; // resolved == rootDirAbs_，允许访问根目录
+    // 斜杠必须加在"被查找的根前缀"上：rootDirAbs_ 是 realpath 输出（无尾斜杠），
+    // 直接前缀匹配会让 "/static" 匹配上 "/static-evil/..."（穿越）。
+    // 加在 resolved 上没用——那改变不了"rootDirAbs_ 是 resolved 的前缀"这个判定。
+    std::string rootPrefix(rootDirAbs_);
+    rootPrefix += '/';
+    return std::string(resolved).rfind(rootPrefix, 0) == 0;
+}
+
+// 获取time_t对应的HTTP日期格式字符串
+static std::string httpDate(time_t t) {
+    char buf[128];
+    struct tm tm;
+    if(gmtime_r(&t, &tm) == nullptr) {
+        return "";
+    }
+    strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    return std::string(buf);
+}
+
+// 反向解析 If-Modified-Since → time_t，失败返回 false
+static bool parseHttpDate(const std::string& s, time_t* out) {
+    struct tm tm;
+    if (strptime(s.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm) == nullptr) {
+        return false;
+    }
+    *out = timegm(&tm);
+    return true;
 }
 
 // 返回 true 表示成功处理（文件不存在时返回 false，由调用方给 404）
@@ -52,8 +78,9 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
     struct stat st;
     if (stat(resolved, &st) != 0) return false;
 
-    // 3. 目录 → 尝试 index.html
-    if (S_ISDIR(st.st_mode)) { // 判断是否是目录
+    // 3. 如果是目录 → 尝试 index.html
+    if (S_ISDIR(st.st_mode)) { 
+        // 是目录则查找默认索引文件
         std::string indexPath = filepath + "index.html";
         char indexResolved[PATH_MAX];
         if (realpath(indexPath.c_str(), indexResolved) == nullptr) return false;
@@ -68,7 +95,6 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
             return true;
         }
 
-        // 4. 设置文件作为响应体
         resp->setFileBody(indexResolved, st.st_size);
         resp->setStatusCode(HttpResponse::k200Ok);
         resp->addHeader("Content-Type", getMimeType(indexResolved)); // 用实际文件(index.html)判定 MIME，目录路径无扩展名
@@ -77,18 +103,83 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
         return true;
     }
 
-    // 4. 检查文件大小
+    // 4. 协商缓存
+    std::string ims = req.getHeader("If-Modified-Since");
+    time_t imsTime;
+    if(req.method() == HttpRequest::kGet && !ims.empty() && parseHttpDate(ims, &imsTime) && st.st_mtime <= imsTime) {
+        resp->setStatusCode(HttpResponse::k304NotModified);       // 需要新枚举值
+        resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+        resp->addHeader("Cache-Control", "public, max-age=60");
+        return true;   // 无 body → toString() 自然无 Content-Length，符合 304 规范
+    }
+
+    // 5. 检查文件大小
     if (st.st_size > maxFileSizeBytes_) {
         *resp = HttpResponse::makeError(HttpResponse::k413PayloadTooLarge, "Payload Too Large");
         return true;
     }
 
-    // 5. 读取并返回（空文件 = 200 OK + 空 body）
+    // 6. 小文件走缓存
+    if(st.st_size <= kCacheThreshold) {
+        // 先查缓存
+        {        
+            std::lock_guard<std::mutex> lock(mtx_);  // 保护 cacheMap_ 和 lruList_
+            auto it = cacheMap_.find(resolved);
+            if (it != cacheMap_.end() && it->second.mtime == st.st_mtime) {  // ← mtime 失效检查
+                resp->setBody(it->second.content);        // 直接给内存里的内容,不读磁盘
+                // 更新 LRU:erase 旧迭代器 + push_front + 更新 lruIt
+                lruList_.erase(it->second.lruList_);
+                lruList_.push_front(resolved);
+                it->second.lruList_ = lruList_.begin();
+                resp->setStatusCode(HttpResponse::k200Ok);
+                resp->addHeader("Content-Type", getMimeType(resolved));
+                resp->addHeader("Content-Length", std::to_string(it->second.content.size()));
+                resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+                resp->addHeader("Cache-Control", "public, max-age=60");
+                return true;
+            }
+        }
+
+        // 缓存不存在或失效 → 读文件
+        std::string content = readFile(resolved);
+        if (content.empty() && st.st_size > 0) { // 文件存在但读失败
+            LOG_WARN << "Failed to read file: " << resolved;
+            *resp = HttpResponse::makeError(HttpResponse::k500InternalServerError, "Internal Server Error");
+            return true;
+        }
+
+        // 加入缓存
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            // 缓存文件内容（只缓存小文件）
+            if (cacheMap_.size() >= kMaxCacheEntries) { // 淘汰最久未使用的
+                const std::string& oldestPath = lruList_.back();
+                cacheMap_.erase(oldestPath);
+                lruList_.pop_back();
+            }
+            lruList_.push_front(resolved);
+            cacheMap_[resolved] = {content, st.st_mtime, lruList_.begin()};
+
+            resp->setBody(content);
+            resp->setStatusCode(HttpResponse::k200Ok);
+            resp->addHeader("Content-Type", getMimeType(resolved));
+            resp->addHeader("Content-Length", std::to_string(content.size()));
+            resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+            resp->addHeader("Cache-Control", "public, max-age=60");
+            return true;
+        }
+    }
+
+    // 大文件
+    // 7. 读取并返回（空文件 = 200 OK + 空 body）
     resp->setFileBody(resolved, st.st_size);
     resp->setStatusCode(HttpResponse::k200Ok);
     resp->setStatusMessage("OK");
-    resp->addHeader("Content-Type", getMimeType(req.path()));
+    resp->addHeader("Content-Type", getMimeType(resolved));
     resp->addHeader("Content-Length", std::to_string(st.st_size));
+    resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+    resp->addHeader("Cache-Control", "public, max-age=60");
+    resp->addHeader("Accept-Ranges", "bytes"); // 支持断点续传
     return true;
 }
 
@@ -121,12 +212,14 @@ std::string StaticFileHandler::readFile(const std::string& filepath)  // 读文�
     // 文件大小检查
     file.seekg(0, std::ios::end);
     long long size = file.tellg();
+
+    // 如果文件大小超过限制，直接返回空字符串
     if(size > maxFileSizeBytes_){
         LOG_DEBUG << "File size exceeds limit: " << filepath;
         return "";
     }
+
     file.seekg(0, std::ios::beg); // 回到文件开头
-    
     std::ostringstream buffer;
     if(file){
         buffer << file.rdbuf();
