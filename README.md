@@ -1,185 +1,207 @@
-# Reactor 网络编程学习仓库
+# Reactor
 
-从 `select` 到多线程 Reactor HTTP 服务器，逐步深入 Linux 高性能网络编程。
+[![CI](https://github.com/AKie-chen/LearningReactor/actions/workflows/ci.yml/badge.svg)](https://github.com/AKie-chen/LearningReactor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)]()
 
-## 学习路线
+基于 **epoll ET** 从零实现的多线程 **Reactor 模式** C++17 HTTP 服务器。
 
-```
-demo-select        I/O 多路复用入门, fd_set + select()
-    ↓
-demo-poll          突破 1024 fd 限制, pollfd 数组
-    ↓
-demo-epoll-LT      内核事件驱动, epoll LT 模式
-    ↓
-demo-epoll-ET      边缘触发, 非阻塞 I/O, readv 双缓冲
-    ↓
-reactor/           EventLoop → Channel → Buffer → TcpConnection
-                   → Acceptor + TcpServer → HTTP → TimerQueue
-                   → ThreadPool → Multi-Reactor
-```
+核心设计参考 muduo：主从 Reactor 线程模型、`eventfd` 跨线程唤醒、`timerfd` 定时器、非阻塞 I/O + 三区缓冲区。提供路由、静态文件服务、结构化日志、优雅关闭、指标监控等生产级基础能力，在 4 核机器上实测吞吐 **5 万 req/s**。
 
-## 目录结构
+## 特性
 
-```
-Reactor/
-├── demo-select/            # 阶段 1: select() 回显服务器
-│   ├── server.cpp
-│   ├── client.cpp
-│   └── CMakeLists.txt
-│
-├── demo-poll/              # 阶段 2: poll() 回显服务器
-│   ├── server.cpp
-│   ├── client.cpp
-│   └── CMakeLists.txt
-│
-├── demo-epoll-LT/          # 阶段 3: epoll LT 回显服务器
-│   ├── server.cpp
-│   ├── client.cpp
-│   └── CMakeLists.txt
-│
-├── demo-epoll-ET/          # 阶段 4: epoll ET 回显服务器
-│   ├── server.cpp          #        (Reactor 改造的起点)
-│   ├── client.cpp
-│   └── CMakeLists.txt
-│
-└── reactor/                # 阶段 5: 多线程 Reactor HTTP 服务器 (8 步优化)
-    ├── include/            # 19 个头文件
-    ├── src/                # 17 个源文件
-    ├── CMakeLists.txt
-    └── README.md           # 详细架构文档
-```
-
-## 四个 I/O 模型对比
-
-| 模型 | 实现 | fd 上限 | 通知方式 | 内核开销 |
-|------|------|---------|----------|----------|
-| `select` | `demo-select` | 1024 | 轮询全部 fd | O(n) |
-| `poll` | `demo-poll` | 无上限 | 轮询全部 fd | O(n) |
-| `epoll LT` | `demo-epoll-LT` | 无上限 | 只返回就绪 fd | O(1) |
-| `epoll ET` | `demo-epoll-ET` | 无上限 | 只通知状态变化 | O(1) 最少 |
-
-### 各阶段关键知识点
-
-**demo-select**: `FD_ZERO` / `FD_SET` / `select()` 的 fd_set 大小写传递、1024 硬限制
-
-**demo-poll**: `pollfd` 结构体、`revents` 字段、事件遍历复杂度
-
-**demo-epoll-LT**: `epoll_create1` / `epoll_ctl` / `epoll_wait`、LT 模式的重复通知
-
-**demo-epoll-ET**: 非阻塞 I/O + `while` 读到 EAGAIN、`readv` + `iovec[2]` 批量读取
-
-**reactor/**: 完整的事件驱动架构，详见 [reactor/README.md](reactor/README.md)
-
-## 编译所有 Demo
-
-```bash
-# 逐个编译
-cd demo-select && mkdir -p build && cd build && cmake .. && make
-cd demo-poll && mkdir -p build && cd build && cmake .. && make
-cd demo-epoll-LT && mkdir -p build && cd build && cmake .. && make
-cd demo-epoll-ET && mkdir -p build && cd build && cmake .. && make
-
-# 运行 (终端 1)
-./demo-epoll-ET/build/server
-
-# 测试 (终端 2)
-./demo-epoll-ET/build/client
-# 或
-nc localhost 8080
-```
-
-## Reactor HTTP 服务器
-
-12 步迭代，从单文件 epoll echo 演进到具备生产级基础能力的 HTTP 服务器。
-
-### 功能迭代 (Step 1–8)
-
-| # | 优化 | 产出 |
-|---|------|------|
-| 1 | 结构化日志 | LogStream + Logger, 5 级过滤, 时间戳 + 文件行号 |
-| 2 | 优雅关闭 | SignalHandler, eventfd + epoll 集成 POSIX 信号 |
-| 3 | HTTP 错误处理 | 400/403/404/405/413/500/505, ParseError 分类 |
-| 4 | 路由 + 静态文件 | Router (method+path), StaticFileHandler (realpath 防穿越) |
-| 5 | 配置系统 | CLI + 配置文件, 两遍扫描 (CLI 优先) |
-| 6 | TCP 优化 | TCP_NODELAY, SO_KEEPALIVE, 可配置 backlog, 连接上限 |
-| 7 | 指标监控 | 6 个 atomic 计数器, /stats JSON, lock-free |
-| 8 | 稳定性修复 | shutdown 完整关闭, pthread TPP 崩溃 workaround |
-
-### 并发安全 + 性能修复 (Step 9–12)
-
-| # | 优化 | 关键修复 |
-|---|------|----------|
-| 9 | shared_ptr 重构 | TcpConnection 裸指针→shared_ptr+enable_shared_from_this, handleClose 防重入, fd 双重关闭, Channel 析构安全, TcpServer connections_ 加锁 |
-| 10 | 第二轮 BugFix | resetTimer 过期时间修复 (+now), TimerQueue multimap 防 key 冲突, cancel 已取出 timer 同步清理 id2exp_, EventLoop 锁范围缩小 + callingPendingFunctors_, snprintf 返回值 clamp, events_ 动态扩容, Buffer prepend O(1) 预留区 |
-| 11 | 第三轮 BugFix | TimerQueue 跨线程 assert 防御, EPOLLRDHUP/EPOLLERR errorCallback, Buffer::append 指数扩容, ThreadPool running_ atomic, Log flush 优化 |
-| 12 | 压测 + 文档 | 多场景 wrk 压测, 并发-吞吐量曲线, 累计 317 万请求零错误 |
-
-```bash
-cd reactor && mkdir -p build && cd build && cmake .. && make
-./main
-
-# 命令行参数
-./main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
-
-# 测试
-curl http://localhost:8080/                  # 路由 → Hello, World!
-curl http://localhost:8080/index.html         # 静态文件
-curl http://localhost:8080/stats              # 指标 JSON
-wrk -t4 -c100 -d30s http://127.0.0.1:8080/
-```
-
-详细架构、性能数据、设计决策见 [reactor/README.md](reactor/README.md)。
-
-## 压测概览
-
-测试环境: AMD Ryzen 7 7735H (4核8线程), Linux 6.6.88, Release 编译, 单机回环
-
-### 并发-吞吐量曲线 (修复后)
-
-| 并发连接 | 10 | 50 | 100 | 300 | 500 | 800 | 1000 | 1500 | 2000 |
-|----------|----|----|-----|-----|-----|-----|------|------|------|
-| QPS | 10.1k | 14.1k | 14.8k | 19.3k | 22.6k | 24.4k | 24.7k | **26.0k** | 25.6k |
-| P50 | 0.6ms | 3.2ms | 6.6ms | 14.6ms | 21.0ms | 31.5ms | 38.2ms | 54.3ms | 74.2ms |
-
-### 多场景 Summary (修复后)
-
-| wrk 场景 | 吞吐量 | P50 | P99 |
-|----------|--------|-----|-----|
-| 4t × 100 conn × 10s | **14,752 req/s** | 6.63 ms | 13.31 ms |
-| 4t × 500 conn × 10s | **22,633 req/s** | 21.04 ms | 51.72 ms |
-| 4t × 1500 conn × 10s (峰值) | **26,036 req/s** | 54.34 ms | 113.66 ms |
-| 静态文件 (131B HTML) | 13,663 req/s | 7.05 ms | 14.16 ms |
-
-> 累计 **317 万**请求，**零崩溃**，**零错误**。P0-1 定时器修复后 keep-alive 正常工作，吞吐提升 15%。
-
-## 核心技术栈
-
-| 机制 | 用途 |
+| 类别 | 内容 |
 |------|------|
-| `epoll` ET | 事件驱动 I/O |
-| `timerfd_create` | 定时器 (CLOCK_MONOTONIC) |
-| `eventfd` | 跨线程唤醒 + 信号通知 |
-| `readv` / `write` | 分散/聚集 I/O |
-| `fcntl(O_NONBLOCK)` | 非阻塞 fd |
-| `SO_REUSEADDR` | 地址重用, 快速重启 |
-| `TCP_NODELAY` | 禁用 Nagle, 降低延迟 |
-| `SO_KEEPALIVE` | 死连接检测 |
-| `realpath(3)` | 路径穿越防护 |
-| `sigaction` | POSIX 信号处理 |
-| `CLOCK_MONOTONIC` | 不受系统时间跳变影响 |
-| `MSG_NOSIGNAL` | 避免 SIGPIPE |
-| `std::atomic` | 无锁计数器 (Metrics) |
+| I/O 模型 | epoll ET 边缘触发, 非阻塞 I/O, TCP_NODELAY, SO_KEEPALIVE |
+| 并发模型 | 主从 Reactor (主线程 accept + N 个 IO 子线程) + 工作线程池 |
+| 缓冲区 | readv 批量读取, prependable 三区模型, 自动扩容 |
+| HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive, 状态机解析 (跨 TCP 拆包) |
+| 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 505, 按错误分类 |
+| 路由 | 精确匹配 (method + path) + 参数化路由 (`/user/:id`) + 通配符 |
+| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存, 304 协商缓存, 大文件流式发送 |
+| 定时器 | timerfd + CLOCK_MONOTONIC, O(log n) 取消, 空闲连接超时 |
+| 日志 | 5 级过滤, 时间戳 + 文件:行号 |
+| 信号 | SIGINT/SIGTERM 优雅关闭: 停止 accept → 排空活跃连接 → 退出 |
+| 配置 | 命令行 + key=value 配置文件, CLI 优先 |
+| 指标 | 6 个 lock-free atomic 计数器, `/stats` JSON 端点 |
+| 安全 | 请求头大小限制 (单行 8KB / 累计 64KB → 413), 连接数上限, 503 背压 |
 
-## 环境要求
+## 快速开始
 
-- Linux kernel ≥ 2.6.27
+### 环境要求
+
+- Linux kernel ≥ 2.6.27（需要 `epoll` / `timerfd_create` / `eventfd`）
 - CMake ≥ 3.10
-- GCC ≥ 8 (C++17)
+- GCC ≥ 8 或 Clang ≥ 7（C++17）
 - pthread
 
-## 参考资料
+### 构建
+
+```bash
+git clone https://github.com/AKie-chen/LearningReactor.git
+cd LearningReactor
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### 运行
+
+```bash
+# 默认配置: 端口 8080, 4 IO 线程, 4 工作线程, 超时 10s, 静态目录 ./static
+./build/main
+
+# 命令行参数
+./build/main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
+
+# 配置文件 + CLI 覆盖 (CLI 优先级更高)
+./build/main -c server.conf -p 9090
+
+# 查看全部选项
+./build/main -h
+```
+
+### 命令行参数
+
+| 参数 | 含义 | 默认值 |
+|------|------|--------|
+| `-p, --port` | 监听端口 | 8080 |
+| `-i, --io` | IO 线程数 (sub event loops) | 4 |
+| `-w, --workers` | 工作线程数 (路由/静态文件) | 4 |
+| `-d, --static-dir` | 静态文件根目录 | ./static |
+| `-t, --timeout` | 空闲连接超时 (秒) | 10 |
+| `-m, --max-file-size` | 单个静态文件大小上限 (MB) | 10 |
+| `-q, --max-queue-size` | 线程池队列上限 | 1024 |
+| `--log-level` | TRACE/DEBUG/INFO/WARN/ERROR | INFO |
+| `-c, --config` | 配置文件路径 | - |
+| `-h, --help` | 帮助 | - |
+
+### 配置文件格式
+
+```ini
+# server.conf
+port = 8080
+io_threads = 4
+worker_threads = 4
+static_dir = ./static
+timeout = 30
+log-level = INFO
+max_file_size = 10
+max_queue_size = 1024
+max_connections = 10000
+```
+
+> `max_connections`（连接数上限）仅在配置文件中可设置，CLI 不支持。
+
+## 测试
+
+```bash
+# 基础路由
+curl http://localhost:8080/             # 200 Hello, World!
+curl http://localhost:8080/user/42      # 200 user id: 42
+curl http://localhost:8080/stats        # 200 指标 JSON
+
+# 静态文件
+curl http://localhost:8080/index.html   # 200 (目录自动找 index.html)
+curl -I http://localhost:8080/a.txt     # HEAD: 200, 无 body
+
+# 错误处理
+curl http://localhost:8080/nonexist     # 404
+curl -X POST http://localhost:8080/     # 405
+
+# 压力测试
+wrk -t4 -c100 -d10s http://127.0.0.1:8080/
+```
+
+本项目自带 GitHub Actions CI（`.github/workflows/ci.yml`），在 gcc/clang × Release/Debug 四组矩阵上构建并跑冒烟测试。
+
+## 性能
+
+测试环境: 4 核 Linux (Anolis OS 12, GCC 12.3), Release 编译 (`-O2`), 单机回环, wrk 默认配置。
+
+| 并发连接 | 吞吐量 (req/s) | P50 | Max |
+|----------|----------------|-----|-----|
+| 100 | **49,587** | 1.98 ms | 26.17 ms |
+| 500 | **49,006** | 10.05 ms | 27.07 ms |
+| 1000 | **46,588** | 20.98 ms | 63.76 ms |
+| 1500 | **29,208** | 50.68 ms | 111.82 ms |
+| 2000 | **24,972** | 78.42 ms | 136.62 ms |
+
+| 场景 | 配置 | 吞吐量 (req/s) | P50 |
+|------|------|----------------|-----|
+| 动态路由 (Hello World) | 100 conn × 10s | 49,587 | 1.98 ms |
+| 静态文件 (缓存命中) | 100 conn × 10s | **61,839** | 1.64 ms |
+| 高并发 | 2000 conn × 10s | 24,972 | 78.42 ms |
+
+累计测试 **250 万+ 请求零错误**；ASan/UBSan 下混合流量（并发 + 错误请求 + 静态文件）零内存错误，SIGINT 优雅关闭排空活跃连接后干净退出。
+
+> 延迟随并发线性增长，符合线程池排队效应的 Reactor 模型预期；4 核下饱和吞吐约 5 万 req/s，瓶颈在 CPU 而非架构。
+
+## 项目结构
+
+```
+LearningReactor/
+├── include/                  # 头文件
+│   ├── EventLoop.h           # epoll 事件循环 (主线程 + 子线程)
+│   ├── Channel.h             # fd + events + 回调 抽象
+│   ├── Acceptor.h            # listenfd 封装, accept 循环
+│   ├── TcpServer.h           # 服务器入口, 连接数管理
+│   ├── TcpConnection.h       # 连接生命周期 (shared_ptr 管理)
+│   ├── HttpContext.h         # HTTP 请求解析状态机 (限长)
+│   ├── HttpRequest.h         # 请求数据结构
+│   ├── HttpResponse.h        # 响应序列化 + 错误工厂
+│   ├── Router.h              # 精确 + 参数化 + 通配符路由
+│   ├── StaticFileHandler.h   # 静态文件 + LRU 缓存 + 防穿越
+│   ├── TimerQueue.h          # timerfd 定时器队列
+│   ├── ThreadPool.h          # 工作线程池 (有界队列)
+│   ├── Buffer.h              # 非连续缓冲区
+│   ├── Metrics.h             # lock-free 指标计数器
+│   ├── SignalHandler.h       # 信号 → eventfd 集成
+│   ├── Config.h              # 配置结构 + CLI/文件解析
+│   └── Log.h                 # 结构化日志
+├── src/                      # 实现
+├── docs/
+│   └── ARCHITECTURE.md       # 架构详解 + 关键设计决策
+├── .github/workflows/ci.yml  # CI
+├── CMakeLists.txt
+└── LICENSE
+```
+
+## 架构概览
+
+```
+main
+├── Config              命令行 + 配置文件
+├── SignalHandler       SIGINT/SIGTERM → eventfd → 优雅关闭
+├── Logger              5 级日志
+├── Metrics             6 个 atomic 计数器
+├── Router              路由表
+├── StaticFileHandler   静态文件 + 缓存
+├── ThreadPool          工作线程 (路由/静态文件处理)
+├── EventLoop (主)      accept + 信号 + 定时器
+│   ├── TimerQueue      timerfd, 连接超时
+│   ├── Acceptor        监听 socket
+│   └── EventLoopThread × N  子事件循环 (连接 I/O)
+└── TcpConnection       HttpContext + Buffer + Channel + timer
+```
+
+一次 HTTP 请求的数据流: `epoll_wait → Channel::handleEvent → TcpConnection::handleRead → Buffer::readFd (ET 循环读) → HttpContext::parseRequest (状态机) → ThreadPool::tryRun (路由 + 静态文件) → EventLoop::queueInLoop (切回 IO 线程) → TcpConnection::send`。详细设计决策见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 已知局限
+
+- HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding、URL 半角解码仅限 `%xx`、无 pipeline
+- 线程池队列满时返回 503，无复杂背压策略
+- 无 SSL/TLS、无 HTTP/2、无 WebSocket
+- 静态文件使用 read + write 流式发送，未用 sendfile 零拷贝
+- 路由不支持正则，仅精确匹配 + `:param` + `*` 通配
+- 指标无延迟分位数 histogram
+
+## License
+
+[MIT](LICENSE)
+
+## 参考
 
 - [muduo — 陈硕的 C++ 网络库](https://github.com/chenshuo/muduo)
 - [The C10K Problem](http://www.kegel.com/c10k.html)
-- Beej's Guide to Network Programming
-- Linux man: `epoll(7)`, `timerfd_create(2)`, `eventfd(2)`, `readv(2)`
+- Linux man: `epoll(7)`, `timerfd_create(2)`, `eventfd(2)`, `readv(2)`, `realpath(3)`

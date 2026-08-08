@@ -57,8 +57,13 @@ void Router::addRoute(HttpRequest::Method method, const std::string& path, Handl
 // 查找并执行
 RouterResult Router::route(const HttpRequest& req, HttpResponse* resp, std::map<std::string, std::string>* params) {
 
+    // HEAD 与 GET 语义等价（RFC 7231 §4.3.2）：按 GET 查找路由，
+    // 响应 body 由调用方按 HEAD 语义裁掉（main 中 isHead 分支）
+    HttpRequest::Method method = req.method();
+    if (method == HttpRequest::kHead) method = HttpRequest::kGet;
+
     // 先尝试精确匹配
-    auto it = routes_.find({req.method(), req.path()});
+    auto it = routes_.find({method, req.path()});
     if (it != routes_.end()) {
         it->second(req, resp, *params); // 执行处理函数
         return RouterResult::kFound;
@@ -68,7 +73,7 @@ RouterResult Router::route(const HttpRequest& req, HttpResponse* resp, std::map<
     auto pathIt = pathToMethods_.find(req.path());
     if (pathIt != pathToMethods_.end()) {
         // 该路径存在，但方法不支持
-        if(pathIt->second.find(req.method()) == pathIt->second.end()) {
+        if(pathIt->second.find(method) == pathIt->second.end()) {
             return RouterResult::kMethodNotAllowed;
         }
         // 如果方法支持，但没有找到对应的处理函数，返回 404
@@ -84,7 +89,7 @@ RouterResult Router::route(const HttpRequest& req, HttpResponse* resp, std::map<
     for (const auto& paramRoute : paramRoutes_) {
         if (matchPattern(paramRoute.first, req.path(), params)) {
             patternMatchedButMethodNot = true;
-            auto methodIt = paramRoute.second.find(req.method());
+            auto methodIt = paramRoute.second.find(method);
             if (methodIt != paramRoute.second.end()) {
                 methodIt->second(req, resp, *params);  // handler 第三参就是 :id 提取出的值
                 return RouterResult::kFound;

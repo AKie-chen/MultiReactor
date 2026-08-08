@@ -1,6 +1,6 @@
-# TinyReactor — 从 epoll echo 到生产级 Reactor HTTP 服务器
+# Reactor — 架构详解与设计决策
 
-基于 Linux epoll ET 模式从零构建的 C++ 高性能 HTTP 服务器，12 步迭代（8 功能 + 4 稳定性/性能修复），每个优化对应独立的功能增量。
+基于 Linux epoll ET 模式从零构建的 C++17 高性能 HTTP 服务器。本文档记录 13 步迭代（功能 + 稳定性/性能修复），每个优化对应独立的功能增量。
 
 ## 架构
 
@@ -44,15 +44,17 @@ epoll_wait → Channel::handleEvent
 |------|------|
 | I/O 模型 | epoll ET, 非阻塞 I/O, TCP_NODELAY, SO_KEEPALIVE |
 | 缓冲区 | readv, prependable 三区模型, 自动扩容/缩容 |
-| HTTP | GET/POST/HEAD 解析, Content-Length, 状态机, 400/403/404/405/413/500/505 |
-| 路由 | 精确匹配 (method + path), 可扩展 handler |
-| 静态文件 | 磁盘文件读取, MIME 映射, realpath 路径穿越防护, 目录→index.html |
+| HTTP | GET/POST/HEAD, Content-Length, 状态机, HEAD 等价 GET (RFC 7231), Connection 头 (RFC 7230) |
+| 错误处理 | 400/403/404/405/413/500/505, 按错误分类 |
+| 路由 | 精确匹配 + 参数化 (`/user/:id`) + 通配符 (`*`) |
+| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存, 304 协商缓存, 目录→index.html |
 | 定时器 | timerfd + CLOCK_MONOTONIC, O(log n) cancel, 可配置超时 |
-| 日志 | 结构化输出, 5 级过滤, 时间戳 + 文件:行号, swappable 输出 |
-| 信号 | SIGINT/SIGTERM 优雅关闭, eventfd 集成到 epoll |
+| 日志 | 结构化输出, 5 级过滤, 时间戳 + 文件:行号 |
+| 信号 | SIGINT/SIGTERM 优雅关闭 (排空), eventfd 集成到 epoll |
 | 配置 | CLI + key=value 配置文件, 两遍扫描 (CLI 优先) |
+| 安全 | 请求头限长 (8KB/行, 64KB 累计 → 413), 连接数上限, 503 背压 |
 | 指标 | 6 个 atomic 计数器, /stats JSON 端点, lock-free |
-| 多线程 | 主从 Reactor + 线程池, eventfd 跨线程唤醒, 连接数上限 |
+| 多线程 | 主从 Reactor + 线程池, eventfd 跨线程唤醒 |
 | 协议 | HTTP/1.1, 支持 curl/ab/wrk |
 
 ## 快速开始
@@ -67,26 +69,24 @@ epoll_wait → Channel::handleEvent
 ### 编译
 
 ```bash
-cd reactor
-mkdir -p build && cd build
-cmake ..
-make
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
 ### 运行
 
 ```bash
-# 默认配置 (端口 8080, 4 IO 线程, 4 工作线程)
-./main
+# 默认配置 (端口 8080, 4 IO 线程, 4 工作线程, 超时 10s)
+./build/main
 
 # 命令行参数
-./main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
+./build/main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
 
 # 配置文件 + CLI 覆盖 (CLI 优先级高于文件)
-./main -c server.conf -p 9090
+./build/main -c server.conf -p 9090
 
 # 查看全部选项
-./main -h
+./build/main -h
 ```
 
 ### 配置文件格式
@@ -98,10 +98,10 @@ io_threads = 4
 worker_threads = 4
 static_dir = ./static
 timeout = 10
-log_level = INFO
+log-level = INFO
 max_file_size = 10
-listen_backlog = 128
-max_connections = 10000
+max_queue_size = 1024
+max_connections = 10000   # 连接数上限, 仅配置文件支持
 ```
 
 ### 测试
@@ -121,37 +121,30 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 
 ## 性能
 
-测试环境: AMD Ryzen 7 7735H (4核8线程), Linux 6.6.88, 单机回环, Release 编译 (`-O2`)
+测试环境: 4 核 Linux (Anolis OS 12, GCC 12.3), 单机回环, Release 编译 (`-O2`), wrk 默认配置。
 
 ### 吞吐量 vs 并发度
 
-| 并发连接 | 吞吐量 | P50 延迟 | P99 延迟 |
+| 并发连接 | 吞吐量 | P50 延迟 | Max 延迟 |
 |----------|--------|----------|----------|
-| 10 | 10,082 req/s | 0.58 ms | 1.69 ms |
-| 50 | 14,130 req/s | 3.17 ms | 6.62 ms |
-| 100 | 14,752 req/s | 6.63 ms | 13.31 ms |
-| 200 | 14,640 req/s | 14.27 ms | 28.30 ms |
-| 300 | 19,267 req/s | 14.55 ms | 34.35 ms |
-| 500 | 22,633 req/s | 21.04 ms | 51.72 ms |
-| 800 | 24,398 req/s | 31.48 ms | 69.05 ms |
-| 1000 | 24,652 req/s | 38.23 ms | 97.26 ms |
-| **1500** | **26,036 req/s** | 54.34 ms | 113.66 ms |
-| 2000 | 25,648 req/s | 74.18 ms | 153.51 ms |
+| 100 | **49,587 req/s** | 1.98 ms | 26.17 ms |
+| 500 | **49,006 req/s** | 10.05 ms | 27.07 ms |
+| 1000 | **46,588 req/s** | 20.98 ms | 63.76 ms |
+| 1500 | **29,208 req/s** | 50.68 ms | 111.82 ms |
+| 2000 | **24,972 req/s** | 78.42 ms | 136.62 ms |
 
-### 多场景 Summary (修复后)
+### 多场景 Summary
 
-| 场景 | 配置 | 吞吐量 | P50 | P99 |
-|------|------|--------|-----|-----|
-| Hello World | 100 conn × 10s | **14,752 req/s** | 6.63 ms | 13.31 ms |
-| 高并发 | 500 conn × 10s | **22,633 req/s** | 21.04 ms | 51.72 ms |
-| 静态文件 (131B) | 100 conn × 30s | 13,663 req/s | 7.05 ms | 14.16 ms |
-| 峰值吞吐 | 1500 conn × 10s | **26,036 req/s** | 54.34 ms | 113.66 ms |
+| 场景 | 配置 | 吞吐量 | P50 |
+|------|------|--------|-----|
+| 动态路由 (Hello World) | 100 conn × 10s | **49,587 req/s** | 1.98 ms |
+| 静态文件 (LRU 缓存命中) | 100 conn × 10s | **61,839 req/s** | 1.64 ms |
+| 高并发 | 2000 conn × 10s | **24,972 req/s** | 78.42 ms |
+| ab -k (keep-alive) | 2000 req × 50 conn | 9,789 req/s | 0 失败 |
 
-> **稳定性**: 全量测试累计处理 **317 万请求**，4xx/5xx 错误 = **0**，多轮压测零崩溃。
+> **稳定性**: 本次整理全量测试累计 **250 万+ 请求**零错误；ASan/UBSan 下混合流量（并发 + 错误请求 + 静态文件）零内存错误；SIGINT 优雅关闭排空活跃连接后干净退出。
 >
-> **关键修复影响**: P0-1 (resetTimer 过期时间) 修复前定时器立即到期→keep-alive 完全失效→QPS 仅 ~13k。修复 `now + timeout` 后 keep-alive 正常工作，100 并发 QPS 提升 **15%** (12.8k→14.8k)。
->
-> **瓶颈分析**: 4 核 CPU 极限下饱和吞吐约 26k req/s，延迟随并发线性增长（线程池排队效应），符合 Reactor 模型预期。
+> **瓶颈分析**: 4 核 CPU 极限下饱和吞吐约 5 万 req/s，延迟随并发线性增长（线程池排队效应），符合 Reactor 模型预期。
 
 ## 演进路线
 
@@ -175,12 +168,13 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 | 9 | shared_ptr 重构 | TcpConnection: `enable_shared_from_this`, 回调全改 `shared_ptr`, handleClose 防重入 (`closed_` atomic), fd 归 Channel 统一关闭, destroy 延迟释放守卫防 epoll 悬垂指针, TcpServer::connections_ 加 mutex |
 | 10 | 6 项 BugFix | **P0** resetTimer 过期时间 `now + timeout` (原忘加 now→立即到期→keep-alive 失效); TimerQueue `map→multimap` 防同微秒覆盖, cancel 已取出 timer 同步清 `id2exp_`; EventLoop 锁缩小到 swap + `callingPendingFunctors_`; snprintf n 值 clamp 防越界读; events_ 动态扩容; Buffer prepend O(1) prependable 区 |
 | 11 | 6 项 BugFix | **P0** TimerQueue `addTimer`/`cancel` 加 `assert(isInLoopThread())`; EPOLLRDHUP/EPOLLERR→errorCallback→handleClose; Buffer::append 指数扩容 (cap×2); ThreadPool `running_` `bool→atomic<bool>`; Log stdout 去 flush (行缓冲 `\n` 自动刷) |
-| 12 | 压测 + 文档 | 并发-吞吐量曲线 (10–2000 conn), 多场景 wrk, 峰值 26k QPS, 累计 317 万请求零错误 |
+| 12 | 压测 + 文档 | 并发-吞吐量曲线, 多场景 wrk, 零错误压测 |
+| 13 | 整理 + 修复 | HEAD 等价 GET (RFC 7231), 请求头大小限制 (→413 防 DoS), Connection: close 尊重 (RFC 7230), max_connections 配置键修复, 文档/CI/License 完善 |
 
 ## 项目结构
 
 ```
-reactor/
+LearningReactor/
 ├── include/
 │   ├── Acceptor.h              # listenfd 封装, accept 循环
 │   ├── Buffer.h                # 非连续缓冲区 (readv)
@@ -188,23 +182,27 @@ reactor/
 │   ├── Config.h                # 配置 struct + 解析器
 │   ├── EventLoop.h             # epoll 事件循环
 │   ├── EventLoopThread.h       # EventLoop + thread 绑定
-│   ├── HttpContext.h           # HTTP 请求解析状态机
+│   ├── HttpContext.h           # HTTP 请求解析状态机 (含头部限长)
 │   ├── HttpRequest.h           # HTTP 请求数据结构
 │   ├── HttpResponse.h          # HTTP 响应序列化 + makeError
 │   ├── Log.h                   # 结构化日志系统
 │   ├── Metrics.h               # 指标单例 (atomic 计数器)
-│   ├── Router.h                # URL 路由表
+│   ├── Router.h                # URL 路由表 (精确 + 参数化 + 通配符)
 │   ├── SignalHandler.h         # POSIX 信号 → eventfd 集成
-│   ├── StaticFileHandler.h     # 静态文件服务 + 路径穿越防护
+│   ├── StaticFileHandler.h     # 静态文件 + LRU 缓存 + 路径穿越防护
 │   ├── TcpConnection.h         # 连接生命周期管理
 │   ├── TcpServer.h             # 服务器入口 + 连接计数
-│   ├── ThreadPool.h            # 工作线程池
+│   ├── ThreadPool.h            # 工作线程池 (有界队列)
 │   ├── Timer.h                 # 定时器对象
 │   └── TimerQueue.h            # timerfd 定时器队列
 ├── src/
-│   ├── main.cpp                # 入口 (~155 行)
+│   ├── main.cpp                # 入口
 │   └── *.cpp                   # 各模块实现
-└── CMakeLists.txt
+├── docs/
+│   └── ARCHITECTURE.md         # 本文档
+├── .github/workflows/ci.yml    # CI (gcc/clang × Release/Debug)
+├── CMakeLists.txt
+└── LICENSE
 ```
 
 ## 关键设计决策
@@ -232,14 +230,14 @@ ET 模式下每个事件只通知一次，必须循环读到 EAGAIN。好处是�
 
 ## 已知局限
 
-- HTTP 协议仅支持 GET/POST/HEAD，不支持 chunked transfer-encoding、URL 解码、pipeline
-- ThreadPool 无背压/队列上限
+- HTTP 协议仅支持 GET/POST/HEAD，不支持 chunked transfer-encoding、pipeline
+- URL 解码仅支持 `%xx` 与 `+`，不支持 UTF-8 规范化
+- 线程池队列满时返回 503，无复杂背压策略
 - 无 SSL/TLS
 - 无 sendfile/mmap 零拷贝（静态文件用 read + write）
 - 无 HTTP/2、WebSocket
-- 路由仅精确匹配，不支持参数化路径 (`/user/:id`)
+- 路由支持精确/参数化/通配符，但不支持正则
 - 指标无延迟分位数（histogram）
-- ab (ApacheBench) 不兼容（HTTP/1.0 keep-alive 交互问题）
 
 ## 参考资料
 

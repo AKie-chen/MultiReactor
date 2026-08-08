@@ -42,9 +42,9 @@ static std::string urlDecode(const std::string& src)
     return dest;
 }
 
-HttpContext::HttpContext():state_(kExpectRequestLine)
-                          , contentLength_(0)
-                          , error_(kNoError){}
+HttpContext::HttpContext() : state_(kExpectRequestLine)
+                           , error_(kNoError)
+                           , contentLength_(0) {}
 
 int HttpContext::findCrlf(Buffer* buf, const char* cl ,std::string& line)//查找请求行/请求头
 {
@@ -70,6 +70,10 @@ bool HttpContext::parseRequest(Buffer* buf)
         std::string line;
         if(findCrlf(buf,"\r\n", line) < 0) return false;//数据不够
 
+        if (line.size() > kMaxHeaderLine) {  // 请求行过长（超长 URI 等）
+            error_ = kHeaderTooLarge;
+            return false;
+        }
         if (!parseRequestLine(line, &request_)) return false;  // 格式错误
 
         state_ = kExpectHeaders;
@@ -80,6 +84,11 @@ bool HttpContext::parseRequest(Buffer* buf)
             std::string line;
             if(findCrlf(buf,"\r\n", line) < 0) return false;
             if(line.empty()) break;
+            headerBytes_ += line.size();
+            if (line.size() > kMaxHeaderLine || headerBytes_ > kMaxHeaderBytes) {
+                error_ = kHeaderTooLarge;  // 防 DoS：无界头部会无限吃内存
+                return false;
+            }
             if(!parseHeader(line, &request_)) return false;
         }
 
@@ -99,6 +108,7 @@ void HttpContext::reset()//一个请求处理完，复位等待下一个
 {
     state_ = kExpectRequestLine;
     contentLength_ = 0;
+    headerBytes_ = 0;
     error_ = kNoError;
     request_ = HttpRequest();  // 清空上一个请求的解析数据
 }

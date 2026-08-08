@@ -161,6 +161,14 @@ int main(int argc, char* argv[]) {
                 conn->markForClose();
                 ctx.reset();
                 return;
+            } else if (ctx.error() == HttpContext::kHeaderTooLarge) { // 413 Header Too Large
+                Metrics::instance().errors4xx++;
+                conn->send(HttpResponse::makeError(
+                    HttpResponse::k413PayloadTooLarge,
+                    "Request Header Too Large").toString());
+                conn->markForClose();
+                ctx.reset();
+                return;
             }
         }
 
@@ -188,8 +196,13 @@ int main(int argc, char* argv[]) {
             if (code >= 400 && code < 500) Metrics::instance().errors4xx++;
             else if (code >= 500) Metrics::instance().errors5xx++;
 
-            // HTTP/1.0 默认短连接：响应发送完毕后关闭连接
+            // HTTP/1.1 默认长连接；客户端显式 Connection: close → 响应后关闭（RFC 7230 §6.3）
             bool closeConn = resp.closeConnection();
+            if (req.getHeader("Connection") == "close") {
+                closeConn = true;
+                resp.setCloseConnection(true);
+            }
+            // HTTP/1.0 默认短连接：响应发送完毕后关闭连接
             if (req.version() == "HTTP/1.0" && !closeConn) {
                 closeConn = true;
                 resp.setCloseConnection(true);
