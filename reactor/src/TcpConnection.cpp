@@ -156,6 +156,7 @@ void TcpConnection::handleWrite()
             ::close(item.fileFd);
             sendQueue_.pop();
         }
+        // headers + 文件发完
         else {
             sendQueue_.pop();  // 纯内存且 headers 已空
         }
@@ -193,6 +194,15 @@ void TcpConnection::handleClose()
     destroy();
 }
 
+void TcpConnection::shutdown() // 优雅关闭，停读，输出排空后自动关闭
+{
+    channel_.disableReading(); //不在触发handleRead，拒绝新请求
+    markForClose(); // 标记为关闭
+    if(sendQueue_.empty() && !sending_){ // 没有待发送数据
+        handleClose(); // 没有待发送数据，直接关闭
+    } 
+}
+
 void TcpConnection::destroy()
 {
     // 从 epoll 移除，不再监听任何事件
@@ -206,11 +216,15 @@ void TcpConnection::destroy()
     });
 }
 
-void TcpConnection::sendResponse(const HttpResponse& resp) // 根据isFileBody_选择发送方式
+void TcpConnection::sendResponse(const HttpResponse& resp, bool includeBody) // 根据isFileBody_选择发送方式
 {
     if (resp.isFileBody()) {
-        sendFile(resp.headersToString(), resp.fileBodyPath(), resp.fileBodySize());
+        if (includeBody) {
+            sendFile(resp.headersToString(), resp.fileBodyPath(), resp.fileBodySize());
+        } else {
+            send(resp.headersToString());  // HEAD：只发头部（头里已有真实 Content-Length），不发文件本体
+        }
     } else {
-        send(resp.toString());
+        send(resp.toString(includeBody));
     }
 }

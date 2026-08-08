@@ -24,7 +24,7 @@ public:
     
     void send(const std::string& data); // 发送数据，非阻塞，可能会分多次发送
     void sendFile(const std::string& headers, const std::string& filepath, off_t size); // 发送文件，非阻塞，可能会分多次发送
-    void sendResponse(const HttpResponse& resp); // 根据isFileBody_选择发送方式
+    void sendResponse(const HttpResponse& resp, bool includeBody = true); // 根据isFileBody_选择发送方式；HEAD 请求传 false
 
     void forceClose();
     void markForClose() { closeAfterSend_ = true; }  // 发送队列清空后关闭连接（HTTP/1.0 短连接）
@@ -39,6 +39,7 @@ public:
 
     int fd() const;
     EventLoop* getLoop() const;
+    void shutdown(); // 优雅关闭，停读，输出排空后自动关闭
 private:
     int fd_;
     EventLoop* loop_;

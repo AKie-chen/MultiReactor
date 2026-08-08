@@ -10,13 +10,19 @@ ThreadPool::ThreadPool(size_t numThreads, size_t maxQueueSize)
 
 ThreadPool::~ThreadPool()
 {
+    stop();
+}
+
+void ThreadPool::stop()
+{
     {
-    std::lock_guard<std::mutex> lock(mutex_);
-    running_ = false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        running_ = false;
     }
     cond_.notify_all();
-    for (auto& t : threads_) t.join();
-
+    for (auto& t : threads_) {
+        if (t.joinable()) t.join(); // 可重复调用：已 join 过的线程不再 join
+    }
 }
 
 bool ThreadPool::tryRun(Task task)//提交任务，非阻塞
@@ -40,7 +46,7 @@ size_t ThreadPool::queueSize() const // 获取当前任务队列大小
 
 void ThreadPool::workerLoop() //每个工作的线程
 {
-    while(running_){
+    while(running_ || !tasks_.empty()){ // 停止后仍排空队列中剩余任务
         Task task;
         {
             std::unique_lock<std::mutex> lock(mutex_);

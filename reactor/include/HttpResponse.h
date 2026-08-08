@@ -27,7 +27,7 @@ public:
     static HttpResponse makeError(HttpStatusCode code, const std::string& message);// 创建错误响应对象
 
     void appendToBuffer(Buffer* buf) const;// 序列化成 HTTP 响应报文
-    std::string toString() const;// 将响应对象转换为字符串形式
+    std::string toString(bool includeBody = true) const;// 序列化完整响应；includeBody=false 时只含头部（HEAD 请求用）
     std::string headersToString() const; // 将响应头部转换为字符串形式
 
     void setFileBody(const std::string& filepath, off_t size); // 设置文件作为响应体

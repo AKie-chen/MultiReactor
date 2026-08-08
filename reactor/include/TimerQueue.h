@@ -2,6 +2,8 @@
 #include "Channel.h"
 #include "Timer.h"
 #include <map>
+#include <vector>
+#include <unordered_map>
 
 class EventLoop;
 // 定时器队列 — 管理一组 Timer，用 timerfd + epoll 统一调度
@@ -39,10 +41,20 @@ private:
     int timerfd_;                  // timerfd 文件描述符（内核定时器）
     Channel timerChannel_;         // 用 Channel 包装 timerfd，交给 epoll 监听
 
-    // 使用 multimap：同一微秒可能有多个 timer 到期，map 会覆盖
-    // key = 过期时间（微秒），value = Timer 对象
-    // begin() 永远指向最早到期的 Timer
-    std::multimap<int64_t, Timer> timers_;
-    std::map<int64_t, int64_t> id2exp_; // key = timerId，value = expiration
-    int64_t nextTimerId_ = 1;     // 自增 ID 生成器
+    struct HeapEntry{
+        int64_t expiration; // 过期时间（微秒）
+        int64_t timerId;    // 定时器 ID
+        bool operator<(const HeapEntry& other) const {
+            return expiration != other.expiration ? expiration > other.expiration : timerId > other.timerId;
+        }
+    };
+
+    std::vector<HeapEntry> timerHeap_; // 小顶堆，按 expiration 升序排列
+    std::unordered_map<int64_t, size_t> id2index_; // timerId -> 堆下标
+    std::unordered_map<int64_t, Timer> id2timer_; // timerId -> Timer 对象
+    int64_t nextTimerId_ = 1; // 下一个定时器 ID（从 1 开始：0 被 main.cpp 用作"无定时器"哨兵）
+
+    void siftUp(size_t index);
+    void siftDown(size_t index);
+    void eraseEntry(size_t index);
 };

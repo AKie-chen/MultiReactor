@@ -73,12 +73,34 @@ void TcpServer::start(int listenNum)
     acceptor_.listen(listenNum);
 }
 
+void TcpServer::stopAccepting() // 只停监听，不动现有连接（优雅排空用）
+{
+    acceptor_.close();
+}
+
 void TcpServer::shutdown()
 {
     acceptor_.close();      // 1. 停止接受新连接
+    std::vector<TcpConnection::ptr> conns;
     {
         std::lock_guard<std::mutex> lock(connMutex_);
-        connections_.clear();   // 2. 先释放连接（Channel 析构需要 loop_ 存活）
+        conns.assign(connections_.begin(), connections_.end()); // 2. 复制当前连接
     }
-    subLoops_.clear();      // 3. 再停止 IO 线程
+
+    // 3. 每个连接在自己所属的 IO 线程里优雅关闭。
+    //    之前主线程直接调 conn->shutdown()：TcpConnection 的 Channel/发送队列/定时器
+    //    都是所属 IO 线程独占的，跨线程触碰会与 IO 线程的操作并发（closeCallback →
+    //    TimerQueue::cancel 和 IO 线程的 handleRead 同时改 unordered_map 等），
+    //    导致堆损坏 → SIGSEGV（实测：connections_ 红黑树遍历崩溃 + destroy() 抛
+    //    bad_weak_ptr）。用 queueInLoop 把关闭动作投递到所属线程执行
+    for (auto& conn : conns) {
+        conn->getLoop()->queueInLoop([conn]() { conn->shutdown(); });
+    }
+
+    // 4. 停 IO 线程：quit() 唤醒 epoll_wait；loop() 每轮迭代先执行 pendingFunctors_
+    //    再检查退出标志，所以上面入队的 shutdown 一定先于线程退出执行
+    for (auto& loopThread : subLoops_) {
+        loopThread->getLoop()->quit();
+    }
+    subLoops_.clear();      // 5. EventLoopThread 析构:loop 已 quit,join 立即返回
 }

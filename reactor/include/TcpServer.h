@@ -19,6 +19,7 @@ public:
     void setConnectionCallback(const ConnectionCallback cb);
     void start(int listenNum);
     void shutdown();
+    void stopAccepting(); // 只停监听，不动现有连接（优雅排空用）
     void setMaxConnections(size_t max) { maxConnections_ = max; }
 private:
     EventLoop* loop_;

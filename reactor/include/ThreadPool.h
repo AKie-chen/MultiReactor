@@ -16,6 +16,7 @@ public:
 
     bool tryRun(Task task); // 提交任务，非阻塞
     size_t queueSize() const; // 获取当前任务队列大小
+    void stop(); // 停止线程池：置标志 + 排空剩余任务 + join（可重复调用）
 
 private:
     void workerLoop(); //每个工作的线程

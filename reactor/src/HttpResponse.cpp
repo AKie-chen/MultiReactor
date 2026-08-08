@@ -81,10 +81,11 @@ void HttpResponse::appendToBuffer(Buffer* buf) const// 序列化成 HTTP 响应�
     }
 }
 
-std::string HttpResponse::toString() const// 将响应对象转换为字符串形式
+std::string HttpResponse::toString(bool includeBody) const// 将响应对象转换为字符串形式
 {
     std::string result = headersToString();
-    if(!isFileBody_){
+    // HEAD 请求只允许返回头部（RFC 7231 §4.3.2）：Content-Length 保留真实大小，但不发 body
+    if(includeBody && !isFileBody_){
         result += body_;
     }
 

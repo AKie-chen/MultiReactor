@@ -10,7 +10,13 @@ EventLoopThread::EventLoopThread()
 }
 
 EventLoopThread::~EventLoopThread() {
-    if (loop_) loop_->quit();        // 通知 IO 线程退出
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (loop_) {
+            loop_->quit();           // 通知 IO 线程退出
+            loop_ = nullptr;         // 己方 quit 后置空，防止他人再读到悬垂指针
+        }
+    }
     if (thread_.joinable()) thread_.join();
 }
 
@@ -28,4 +34,11 @@ void EventLoopThread::threadFunc()            // 线程函数：创建 loop → 
     }
     cond_.notify_one(); // 通知等待的线程，loop_已被初始化
     loop->loop(); // 进入事件循环，开始处理事件
+    // loop() 已返回（被 quit）：把 loop_ 置空，防止悬垂。
+    // 否则 shutdown() 显式 quit 后 threadFunc 结束、EventLoop 被释放，
+    // 之后 ~EventLoopThread 再调 loop_->quit() 就是 UAF（ASAN 实测）
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        loop_ = nullptr;
+    }
 }

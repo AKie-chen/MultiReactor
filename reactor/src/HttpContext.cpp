@@ -21,12 +21,14 @@ static std::string urlDecode(const std::string& src)
     for (size_t i = 0; i < src.size(); ++i) {
         if (src[i] == '%') {
             if (i + 2 < src.size()) {
-                int value = 0;
                 int hi = hexVal(src[i + 1]);
                 int lo = hexVal(src[i + 2]);
-                value = (hi << 4) | lo;
-                dest += static_cast<char>(value);
-                i += 2;
+                if (hi >= 0 && lo >= 0) {   // 非法编码（%ZZ/%2Z）必须原样保留，不能输出垃圾字节
+                    dest += static_cast<char>((hi << 4) | lo);
+                    i += 2;
+                } else {
+                    dest += '%';
+                }
             } else {
                 dest += '%';
             }
@@ -97,6 +99,7 @@ void HttpContext::reset()//一个请求处理完，复位等待下一个
 {
     state_ = kExpectRequestLine;
     contentLength_ = 0;
+    error_ = kNoError;
     request_ = HttpRequest();  // 清空上一个请求的解析数据
 }
 

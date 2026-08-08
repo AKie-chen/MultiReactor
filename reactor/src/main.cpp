@@ -29,13 +29,40 @@ int main(int argc, char* argv[]) {
     TcpServer server(&loop, cfg.port, cfg.ioThreads);
     ThreadPool threadPool(cfg.workerThreads, cfg.maxQueueSize);
 
+    // 排空检查函数：main 作用域，而不是 shutdown 回调的局部变量。
+    // 定时器链只按引用捕获它——main 的栈帧在整个排空期间（最长 10s）存活，
+    // 引用始终有效；若放回回调内部则回调一返回就悬垂（UAF 实测），
+    // 而用 shared_ptr 自持会形成引用环（lambda 捕获自身所属对象的
+    // shared_ptr）导致泄漏（LSAN 实测 80B）
+    std::function<void()> drainCheck;
+
     SignalHandler signalHandler(&loop);
     signalHandler.addSignal(SIGINT);
     signalHandler.addSignal(SIGTERM);
-    signalHandler.setShutdownCallback([&loop, &server]() {
-        LOG_INFO << "Shutdown signal received, stopping server...";
-        server.shutdown();
-        loop.quit();
+    signalHandler.setShutdownCallback([&loop, &server, &drainCheck]() {
+        LOG_INFO << "Graceful shutdown: stop accepting, draining connections...";
+
+        // 1. 只停监听：关闭 acceptor，不再接受新连接（现有连接继续服务完毕）
+        server.stopAccepting();
+
+        // 2. 每 100ms 检查一次活跃连接数，归零或超 10s 则退出主循环
+        timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t deadline = (ts.tv_sec * 1'000'000 + ts.tv_nsec / 1'000) + 10 * 1'000'000;
+
+        drainCheck = [&loop, deadline, &drainCheck]() {
+            int64_t active = Metrics::instance().activeConnections.load();
+            timespec t2; clock_gettime(CLOCK_MONOTONIC, &t2);
+            int64_t now = t2.tv_sec * 1'000'000 + t2.tv_nsec / 1'000;
+            LOG_DEBUG << "drain check: active=" << active << " now=" << now << " deadline=" << deadline;
+            if (active == 0 || now >= deadline) {
+                loop.quit();   // 现在才退出主循环。注意不能提前 quit()：
+                               // loop() 的 while 条件在顶部，提前 quit 本迭代结束就退出，
+                               // 之后 addTimer 的检查永远不会再触发（原实现的坑）
+                return;
+            }
+            loop.timerQueue().addTimer([&loop, &drainCheck]() { drainCheck(); }, now + 100'000);  // 100ms
+        };
+        drainCheck();
     });
 
     Router router;
@@ -160,11 +187,13 @@ int main(int argc, char* argv[]) {
                 resp.setCloseConnection(true);
             }
 
-            conn->getLoop()->queueInLoop([conn, resp, closeConn]() {
+            // HEAD 只发头部（RFC 7231 §4.3.2）：Content-Length 保留真实大小，body/文件本体不发
+            bool isHead = (req.method() == HttpRequest::kHead);
+            conn->getLoop()->queueInLoop([conn, resp, closeConn, isHead]() {
                 if(resp.isFileBody()){
-                    conn->sendResponse(resp);
+                    conn->sendResponse(resp, !isHead);
                 } else {
-                    conn->send(resp.toString());
+                    conn->send(resp.toString(!isHead));
                 }
                 if (closeConn) conn->markForClose();
             });
@@ -172,15 +201,21 @@ int main(int argc, char* argv[]) {
 
         if(!submitted) {
             // 队列满 → 背压：返回 503 Service Unavailable
-            // makeError 自动带 "Connection: close" 头，发送后真正关闭连接
+            // 关键决策：HTTP/1.1 默认长连接，拒绝**不关连接**。
+            // 关连接版 503 的代价：客户端重连形成"拒绝→重连→更忙"的自放大
+            // 风暴，且服务端作为主动关闭方堆积 TIME_WAIT（实测：-c1000 满负载
+            // 时每秒数千次重连 + 服务端 3000+ 个 TIME_WAIT 占用 fd）。
+            // 不关连接：拒绝成本恒定，连接留着继续服务后续请求
             HttpResponse resp = HttpResponse::makeError(
                 HttpResponse::k503ServiceUnavailable,
                 "Server Busy, please retry later"
             );
             Metrics::instance().errors5xx++;
-            conn->getLoop()->queueInLoop([conn, data = resp.toString()]() {
-                conn->send(data);
-                conn->markForClose();
+            bool keepAlive = (req.version() == "HTTP/1.1");
+            if (keepAlive) resp.setCloseConnection(false); // makeError 默认关连接，覆盖掉
+            conn->getLoop()->queueInLoop([conn, resp, keepAlive]() {
+                conn->send(resp.toString());
+                if (!keepAlive) conn->markForClose(); // HTTP/1.0 无显式 keep-alive，保持原行为
             });
         }
     });
@@ -191,5 +226,15 @@ int main(int argc, char* argv[]) {
              << ", IO threads:" << cfg.ioThreads
              << ", worker threads:" << cfg.workerThreads;
     loop.loop();
+    // 拆除顺序（两个 ASAN 实测崩溃都出在这三步的顺序上）：
+    // 1) threadPool.stop()：join 所有 worker。worker 任务里 conn->getLoop()->
+    //    queueInLoop() 还引用子循环，所以子循环此刻必须还活着
+    // 2) server.shutdown()：子循环 quit+join、连接全部关闭。这一步必须赶在
+    //    ~ThreadPool（函数返回后执行）之前——否则还活着的子循环线程会通过
+    //    messageCallback → threadPool.tryRun 往即将释放的 tasks_ deque 里
+    //    投递任务（ASAN 实测 heap-use-after-free WRITE，ThreadPool.cpp:35）
+    // 3) 函数返回后 ~threadPool 才真正释放任务队列——此时所有投递方已死
+    threadPool.stop();
+    server.shutdown();
     return 0;
 }

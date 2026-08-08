@@ -9,7 +9,11 @@ Acceptor::Acceptor(EventLoop* loop, uint16_t port)
             listenfd_(socket(AF_INET,SOCK_STREAM,0)), 
             channel_(listenfd_,loop_)
 {
-    ; //创建一个socket，AF_INET表示IPv4协议，SOCK_STREAM表示TCP协议，0表示默认协议
+    // socket 失败:fd 为 -1,后续 bind 必然失败,直接中止并说明原因
+    if (listenfd_ < 0) {
+        LOG_FATAL << "socket() failed: " << strerror(errno);
+    }
+
     fcntl(listenfd_, F_SETFL, O_NONBLOCK); //将socket设置为非阻塞模式
 
     sockaddr_in addr; //定义一个sockaddr_in结构体，用于存储服务器的地址信息
@@ -19,14 +23,20 @@ Acceptor::Acceptor(EventLoop* loop, uint16_t port)
 
     int optval = 1;
     setsockopt(listenfd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)); //设置socket选项，允许地址重用
-    
-    bind(listenfd_,(sockaddr*)&addr,sizeof(addr)); //将socket绑定到指定的地址和端口上
+
+    // bind 失败(如端口已被占用)必须立即暴露,绝不能带病继续:
+    // 否则进程带着未绑定的 fd 静默进入事件循环,永远 accept 不到连接,
+    // "正常启动"却一个请求都不处理(实测:残留进程占端口时的现象)
+    if (bind(listenfd_,(sockaddr*)&addr,sizeof(addr)) < 0) {
+        LOG_FATAL << "bind() port " << port << " failed: " << strerror(errno);
+    }
 }
 
 Acceptor::~Acceptor(){ close(); }
 
 void Acceptor::close() {
     if (listenfd_ >= 0) {
+        channel_.disableAll();   // 同时停止监听：防止 close 后 epoll 残留事件再触发 accept 回调
         ::close(listenfd_);
         listenfd_ = -1;
     }
@@ -44,13 +54,17 @@ int Acceptor::fd()//返回fd
 
 void Acceptor::listen(int listenNum)//开启监听
 {
-    ::listen(listenfd_,listenNum); //监听socket，允许最多5个连接
+    // listenNum 为内核排队连接数上限(backlog),由调用方传入
+    if (::listen(listenfd_,listenNum) < 0) {
+        LOG_FATAL << "listen() failed: " << strerror(errno);
+    }
     handleRead();
 }
 
 void Acceptor::handleRead()  //处理监听
 {
     channel_.setReadCallback([&](){ // 设置可读事件的回调函数
+        if (listenfd_ < 0) return;  // close() 后残留批次事件，不再 accept
         sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         int client_fd;
