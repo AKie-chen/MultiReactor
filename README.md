@@ -7,31 +7,33 @@
 
 基于 **epoll ET** 从零实现的多线程 **Reactor 模式** C++17 HTTP 服务器。
 
-核心设计参考 muduo：主从 Reactor 线程模型、`eventfd` 跨线程唤醒、`timerfd` 定时器、非阻塞 I/O + 三区缓冲区。提供路由、静态文件服务、结构化日志、优雅关闭、指标监控等生产级基础能力，在 4 核机器上实测吞吐 **5 万 req/s**。
+核心设计参考 muduo：主从 Reactor 线程模型、`eventfd` 跨线程唤醒、`timerfd` 定时器、非阻塞 I/O + 三区缓冲区。提供路由、静态文件服务（含 sendfile 零拷贝）、结构化日志、优雅关闭、指标监控等生产级基础能力，实测吞吐 **5.7 万 req/s**（1000 并发）。
 
 ## 特性
 
 | 类别 | 内容 |
 |------|------|
-| I/O 模型 | epoll ET 边缘触发, 非阻塞 I/O, TCP_NODELAY, SO_KEEPALIVE |
-| 并发模型 | 主从 Reactor (主线程 accept + N 个 IO 子线程) + 工作线程池 |
-| 缓冲区 | readv 批量读取, prependable 三区模型, 自动扩容 |
-| HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive, 状态机解析 (跨 TCP 拆包) |
-| 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 505, 按错误分类 |
-| 路由 | 精确匹配 (method + path) + 参数化路由 (`/user/:id`) + 通配符 |
-| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存 (≤64KB), 304 协商缓存, sendfile 零拷贝 (>64KB) |
-| 定时器 | timerfd + CLOCK_MONOTONIC, O(log n) 取消, 空闲连接超时 |
-| 日志 | 5 级过滤, 时间戳 + 文件:行号 |
-| 信号 | SIGINT/SIGTERM 优雅关闭: 停止 accept → 排空活跃连接 → 退出 |
-| 配置 | 命令行 + key=value 配置文件, CLI 优先 |
-| 指标 | 6 个 lock-free atomic 计数器, `/stats` JSON 端点 |
-| 安全 | 请求头大小限制 (单行 8KB / 累计 64KB → 413), 连接数上限, 503 背压 |
+| I/O 模型 | epoll ET 边缘触发, 非阻塞 I/O, TCP_NODELAY, SO_KEEPALIVE, readv + 64KB extrabuf 循环读 |
+| 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 子线程, RR 分发）+ 有界队列工作线程池 |
+| 缓冲区 | prependable 三区模型, 指数扩容 |
+| HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive / pipelining, 状态机解析（跨 TCP 拆包累积） |
+| 解析健壮性 | 头名大小写不敏感（`Content-Length`/`connection:` 等变体均可识别）, 头名尾部空白 trim, Content-Length 全数字校验（拒绝 `5abc` 前缀解析）, body 声明超限立即 413 |
+| 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 505, 按错误分类; 413 触发: 请求行 >8KB / 头部累计 >64KB / body >16MB |
+| 路由 | 精确匹配（method + path）+ 参数化（`/user/:id`）+ 通配符（`*`）; path 先 URL 解码（`%xx` + `+`→空格）后匹配, 连续斜杠折叠, 短 pattern 可匹配长 path |
+| 静态文件 | MIME 映射, realpath + 前缀检查路径穿越防护（穿越 → 403, 符号链接逃逸也拦截）, LRU 内容缓存（≤64KB, 256 条, mtime 失效）, >64KB sendfile 零拷贝, 304 协商缓存（仅 GET; HEAD 不协商）, 目录自动 index.html, POST/PUT 静态资源 → 404 |
+| 背压 | 线程池队列满 → 503 Service Unavailable; HTTP/1.1 下**不关连接**（拒绝后连接继续复用, 避免"拒绝→重连→更忙"风暴） |
+| 定时器 | timerfd + CLOCK_MONOTONIC, 自实现最小堆, 空闲连接超时（默认 10s, 每次请求重置） |
+| 日志 | 5 级过滤, 微秒时间戳 + 文件:行号 |
+| 信号 | SIGINT/SIGTERM 优雅关闭: 停止 accept → 在途请求与排空期请求照常处理（响应强制 `Connection: close`）→ 活跃连接归零即退出, 10s deadline 兜底 |
+| 配置 | 命令行 + key=value 配置文件（`log-level`/`log_level` 均可）, CLI 优先 |
+| 指标 | 6 个 lock-free atomic 计数器（requests / active / err_4xx / err_5xx / bytes_recv / bytes_sent）, `/stats` JSON 端点 |
+| 安全 | 头部与 body 大小限制（防 DoS）, 连接数上限（默认 10000）, 请求行非法字符校验 |
 
 ## 快速开始
 
 ### 环境要求
 
-- Linux kernel ≥ 2.6.27（需要 `epoll` / `timerfd_create` / `eventfd`）
+- Linux kernel ≥ 2.6.27（需要 `epoll` / `timerfd_create` / `eventfd` / `sendfile`）
 - CMake ≥ 3.10
 - GCC ≥ 8 或 Clang ≥ 7（C++17）
 - pthread
@@ -70,8 +72,8 @@ cmake --build build -j$(nproc)
 | `-w, --workers` | 工作线程数 (路由/静态文件) | 4 |
 | `-d, --static-dir` | 静态文件根目录 | ./static |
 | `-t, --timeout` | 空闲连接超时 (秒) | 10 |
-| `-m, --max-file-size` | 单个静态文件大小上限 (MB) | 10 |
-| `-q, --max-queue-size` | 线程池队列上限 | 1024 |
+| `-m, --max-file-size` | 单个静态文件大小上限 (MB), 超出 → 413 | 10 |
+| `--max-queue-size` | 线程池队列上限 (满 → 503) | 1024 |
 | `--log-level` | TRACE/DEBUG/INFO/WARN/ERROR | INFO |
 | `-c, --config` | 配置文件路径 | - |
 | `-h, --help` | 帮助 | - |
@@ -101,13 +103,24 @@ curl http://localhost:8080/             # 200 Hello, World!
 curl http://localhost:8080/user/42      # 200 user id: 42
 curl http://localhost:8080/stats        # 200 指标 JSON
 
+# 参数路由
+curl http://localhost:8080/user/%3Aid   # 200 user id: :id（URL 解码后匹配参数模式）
+curl http://localhost:8080/user//42     # 200 连续斜杠折叠
+curl http://localhost:8080/user/a%20b   # 200 user id: a b
+
 # 静态文件
 curl http://localhost:8080/index.html   # 200 (目录自动找 index.html)
-curl -I http://localhost:8080/a.txt     # HEAD: 200, 无 body
+curl -I http://localhost:8080/big.bin   # HEAD: 200, 有 Content-Length 无 body
+
+# 协商缓存
+curl -I http://localhost:8080/test.txt  # 拿 Last-Modified
+curl -H "If-Modified-Since: <Last-Modified>" -I http://localhost:8080/test.txt  # GET → 304
 
 # 错误处理
 curl http://localhost:8080/nonexist     # 404
 curl -X POST http://localhost:8080/     # 405
+curl -X POST http://localhost:8080/index.html  # 404（静态资源只接受 GET/HEAD）
+curl -H "Content-Length: 104857600" -X POST http://localhost:8080/  # 413（body 超限, 不等数据到齐）
 
 # 压力测试
 wrk -t4 -c100 -d10s http://127.0.0.1:8080/
@@ -117,25 +130,22 @@ wrk -t4 -c100 -d10s http://127.0.0.1:8080/
 
 ## 性能
 
-测试环境: 4 核 Linux (Anolis OS 12, GCC 12.3), Release 编译 (`-O2`), 单机回环, wrk 默认配置。
+测试环境: 4 IO + 4 worker 线程, Release 编译, 本机回环, wrk 4 线程 10s, 动态路由 `/user/123`。
 
 | 并发连接 | 吞吐量 (req/s) | P50 | Max |
 |----------|----------------|-----|-----|
-| 100 | **49,587** | 1.98 ms | 26.17 ms |
-| 500 | **49,006** | 10.05 ms | 27.07 ms |
-| 1000 | **46,588** | 20.98 ms | 63.76 ms |
-| 1500 | **29,208** | 50.68 ms | 111.82 ms |
-| 2000 | **24,972** | 78.42 ms | 136.62 ms |
+| 100 | 41,315 | 2.39 ms | 12.90 ms |
+| 500 | 52,742 | 9.30 ms | 32.40 ms |
+| 1000 | **57,522** | 16.80 ms | 59.18 ms |
+| 2000 | 47,171 | 41.41 ms | 125.64 ms |
 
-| 场景 | 配置 | 吞吐量 (req/s) | P50 |
-|------|------|----------------|-----|
-| 动态路由 (Hello World) | 100 conn × 10s | 49,587 | 1.98 ms |
-| 静态文件 (缓存命中) | 100 conn × 10s | **61,839** | 1.64 ms |
-| 高并发 | 2000 conn × 10s | 24,972 | 78.42 ms |
+| 场景 | 吞吐量 (req/s) | P50 |
+|------|----------------|-----|
+| 动态路由 (Hello World) | 41,315 | 2.39 ms |
+| 静态小文件 (LRU 缓存命中) | **62,188** | 1.62 ms |
+| 大文件 300KB (sendfile 零拷贝) | 14,350 | 6.56 ms |
 
-累计测试 **250 万+ 请求零错误**；ASan/UBSan 下混合流量（并发 + 错误请求 + 静态文件）零内存错误，SIGINT 优雅关闭排空活跃连接后干净退出。
-
-> 延迟随并发线性增长，符合线程池排队效应的 Reactor 模型预期；4 核下饱和吞吐约 5 万 req/s，瓶颈在 CPU 而非架构。
+验证矩阵: 25 项协议测试 + 22 项功能回归全部通过；ASan/UBSan 下 300 并发混合畸形流量零错误；`--max-queue-size 1` + 200 并发实测触发 503 背压（错误响应后连接保持, 无重连风暴）；SIGTERM 压测中优雅关闭: 在途大文件响应完整送达（逐字节校验）、排空期请求正常响应并关闭连接、活跃连接归零后 0.1s 内退出。
 
 ## 项目结构
 
@@ -152,9 +162,9 @@ MultiReactor/
 │   ├── HttpResponse.h        # 响应序列化 + 错误工厂
 │   ├── Router.h              # 精确 + 参数化 + 通配符路由
 │   ├── StaticFileHandler.h   # 静态文件 + LRU 缓存 + 防穿越
-│   ├── TimerQueue.h          # timerfd 定时器队列
+│   ├── TimerQueue.h          # timerfd + 最小堆定时器
 │   ├── ThreadPool.h          # 工作线程池 (有界队列)
-│   ├── Buffer.h              # 非连续缓冲区
+│   ├── Buffer.h              # 三区缓冲区
 │   ├── Metrics.h             # lock-free 指标计数器
 │   ├── SignalHandler.h       # 信号 → eventfd 集成
 │   ├── Config.h              # 配置结构 + CLI/文件解析
@@ -173,13 +183,13 @@ MultiReactor/
 main
 ├── Config              命令行 + 配置文件
 ├── SignalHandler       SIGINT/SIGTERM → eventfd → 优雅关闭
-├── Logger              5 级日志
+├── Logger             5 级日志
 ├── Metrics             6 个 atomic 计数器
-├── Router              路由表
-├── StaticFileHandler   静态文件 + 缓存
-├── ThreadPool          工作线程 (路由/静态文件处理)
+├── Router              路由表 (精确 + 参数 + 通配符)
+├── StaticFileHandler   静态文件 + LRU 缓存 + sendfile
+├── ThreadPool          工作线程 (有界队列, 满 → 503 背压)
 ├── EventLoop (主)      accept + 信号 + 定时器
-│   ├── TimerQueue      timerfd, 连接超时
+│   ├── TimerQueue      timerfd + 最小堆, 连接超时
 │   ├── Acceptor        监听 socket
 │   └── EventLoopThread × N  子事件循环 (连接 I/O)
 └── TcpConnection       HttpContext + Buffer + Channel + timer
@@ -189,10 +199,11 @@ main
 
 ## 已知局限
 
-- HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding、URL 半角解码仅限 `%xx`、无 pipeline
-- 线程池队列满时返回 503，无复杂背压策略
+- HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding
+- URL 解码仅支持 `%xx` 与 `+`→空格, 非法编码原样保留
 - 无 SSL/TLS、无 HTTP/2、无 WebSocket
 - 路由不支持正则，仅精确匹配 + `:param` + `*` 通配
+- 线程池队列满时返回 503，无复杂背压策略
 - 指标无延迟分位数 histogram
 
 ## License
@@ -203,4 +214,4 @@ main
 
 - [muduo — 陈硕的 C++ 网络库](https://github.com/chenshuo/muduo)
 - [The C10K Problem](http://www.kegel.com/c10k.html)
-- Linux man: `epoll(7)`, `timerfd_create(2)`, `eventfd(2)`, `readv(2)`, `realpath(3)`
+- Linux man: `epoll(7)`, `timerfd_create(2)`, `eventfd(2)`, `readv(2)`, `realpath(3)`, `sendfile(2)`

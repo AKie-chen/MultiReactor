@@ -1,5 +1,6 @@
 #include "HttpRequest.h"
 #include <cstring>
+#include <strings.h>  // strcasecmp
 
 void HttpRequest::setMethod(Method m)//设置方法
 {

@@ -48,9 +48,13 @@ static bool matchPattern(const std::string& pattern, const std::string& path,
 // 注册路由：精确匹配 method + path
 void Router::addRoute(HttpRequest::Method method, const std::string& path, Handler handler) {
     routes_[{method, path}] = handler;
-    pathToMethods_[path].insert(method);
     if(path.find(':') != std::string::npos || path.find('*') != std::string::npos) { // 如果路径中包含参数标记
         paramRoutes_.emplace_back(path, std::map<HttpRequest::Method, Handler>{{method, handler}});
+    } else {
+        // 只有静态路径进 pathToMethods_（405 判断用）。
+        // 动态模式不能进：请求 /user/%3Aid 解码后是 /user/:id，若该表
+        // 命中会在此返回 404，永远走不到 paramRoutes_ 动态匹配
+        pathToMethods_[path].insert(method);
     }
 }
 
@@ -62,9 +66,13 @@ RouterResult Router::route(const HttpRequest& req, HttpResponse* resp, std::map<
     HttpRequest::Method method = req.method();
     if (method == HttpRequest::kHead) method = HttpRequest::kGet;
 
-    // 先尝试精确匹配
+    // 先尝试精确匹配。注意：跳过含 `:` / `*` 参数标记的模式——
+    // 它们只能走下面的 paramRoutes_ 动态匹配。否则请求 /user/%3Aid
+    // 解码后是 /user/:id，会字面命中该模式且 params 为空，
+    // handler 里 params.at("id") 抛 out_of_range（worker 线程未捕获 → 崩溃）
     auto it = routes_.find({method, req.path()});
-    if (it != routes_.end()) {
+    if (it != routes_.end() && it->first.path.find(':') == std::string::npos
+                           && it->first.path.find('*') == std::string::npos) {
         it->second(req, resp, *params); // 执行处理函数
         return RouterResult::kFound;
     }

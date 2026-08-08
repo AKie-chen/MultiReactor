@@ -9,13 +9,13 @@ class EventLoop;
 // 定时器队列 — 管理一组 Timer，用 timerfd + epoll 统一调度
 //
 // 工作原理：
-//   1. 内核 timerfd 在最近一个 Timer 的过期时间点变为可读
+//   1. 内核 timerfd 在堆顶（最早到期）Timer 的过期时间点变为可读
 //   2. epoll 检测到 timerChannel_ 的 EPOLLIN → 触发 handleRead()
-//   3. handleRead 遍历 timers_ map，执行所有到期的回调
-//   4. 如果 map 里还有未到期的，resetTimerfd 设置下一次唤醒时间
+//   3. handleRead 弹出所有到期条目（最小堆），执行回调
+//   4. 堆里还有未到期的则 resetTimerfd 设置下一次唤醒时间
 //
-// timers_ 的 key 是过期时间（微秒），value 是 Timer 对象
-// begin() 返回的就是最早到期的 Timer
+// 数据结构是自实现最小堆（timerHeap_），非注释中早期的 map 实现：
+//   timerHeap_ 按 expiration 升序，id2index_ 维护 id → 堆下标
 class TimerQueue {
 public:
     TimerQueue(EventLoop* loop);

@@ -130,8 +130,11 @@ int main(int argc, char* argv[]) {
 
     server.setMessageCallback([&resetTimer, &threadPool, &router, &staticHandler, &isShutdown]
                               (TcpConnection::ptr conn, Buffer* buf) {
-        // 关闭连接,不再接受请求
-        if(isShutdown) { conn->markForClose(); return; }
+        // 排空期（SIGTERM 后）：请求照常处理，但响应后连接即关闭。
+        // 不能静默丢弃——客户端已发出的请求必须得到响应，否则挂起直到超时
+        // （实测：keep-alive 连接在 shutdown 后发请求，无响应挂 3s）。
+        // markForClose 在发送队列清空后自动关连接，排空自然收敛
+        if (isShutdown) conn->markForClose();
 
         HttpContext& ctx = conn->context();
 
@@ -178,7 +181,7 @@ int main(int argc, char* argv[]) {
         Metrics::instance().totalRequests++;
         resetTimer(conn);
 
-        bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler]() {
+        bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler, &isShutdown]() {
             HttpResponse resp;
 
             // 处理路由
@@ -207,6 +210,12 @@ int main(int argc, char* argv[]) {
                 closeConn = true;
                 resp.setCloseConnection(true);
             }
+            // 排空期：即使 keep-alive 也强制 Connection: close，
+            // 每个连接处理完当前请求即关闭，排空才能收敛（否则连接永远挂着）
+            if (isShutdown && !closeConn) {
+                closeConn = true;
+                resp.setCloseConnection(true);
+            }
 
             // HEAD 只发头部（RFC 7231 §4.3.2）：Content-Length 保留真实大小，body/文件本体不发
             bool isHead = (req.method() == HttpRequest::kHead);
@@ -232,7 +241,7 @@ int main(int argc, char* argv[]) {
                 "Server Busy, please retry later"
             );
             Metrics::instance().errors5xx++;
-            bool keepAlive = (req.version() == "HTTP/1.1");
+            bool keepAlive = (req.version() == "HTTP/1.1" && !isShutdown);
             if (keepAlive) resp.setCloseConnection(false); // makeError 默认关连接，覆盖掉
             conn->getLoop()->queueInLoop([conn, resp, keepAlive]() {
                 conn->send(resp.toString());

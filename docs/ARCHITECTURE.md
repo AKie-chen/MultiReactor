@@ -14,7 +14,7 @@ main
 ├── StaticFileHandler (磁盘文件服务 + 路径穿越防护)
 ├── ThreadPool (4 线程, CPU 密集任务)
 ├── EventLoop (主线程, accept + 信号 + 定时器)
-│   ├── TimerQueue (timerfd + eventfd, 连接超时管理)
+│   ├── TimerQueue (timerfd + 自实现最小堆, 连接超时管理)
 │   ├── TcpServer
 │   │   └── Acceptor (SO_REUSEADDR + TCP_NODELAY)
 │   └── EventLoopThread × N (sub loops, 连接 I/O)
@@ -30,7 +30,7 @@ epoll_wait → Channel::handleEvent
       → Metrics::bytesReceived
         → HttpContext::parseRequest (状态机 + 错误分类)
           → Metrics::totalRequests++
-            → ThreadPool::run (工作线程)
+            → ThreadPool::tryRun (工作线程, 有界队列满 → 503 背压)
               → Router::route (精确匹配)
               → StaticFileHandler::handle (fallback, realpath 防穿越)
                 → HttpResponse 构造 + 错误码统计
@@ -121,30 +121,28 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 
 ## 性能
 
-测试环境: 4 核 Linux (Anolis OS 12, GCC 12.3), 单机回环, Release 编译 (`-O2`), wrk 默认配置。
+测试环境: 4 IO + 4 worker 线程, Release 编译, 本机回环, wrk 4 线程 10s, 动态路由 `/user/123`。
 
 ### 吞吐量 vs 并发度
 
 | 并发连接 | 吞吐量 | P50 延迟 | Max 延迟 |
 |----------|--------|----------|----------|
-| 100 | **49,587 req/s** | 1.98 ms | 26.17 ms |
-| 500 | **49,006 req/s** | 10.05 ms | 27.07 ms |
-| 1000 | **46,588 req/s** | 20.98 ms | 63.76 ms |
-| 1500 | **29,208 req/s** | 50.68 ms | 111.82 ms |
-| 2000 | **24,972 req/s** | 78.42 ms | 136.62 ms |
+| 100 | 41,315 req/s | 2.39 ms | 12.90 ms |
+| 500 | 52,742 req/s | 9.30 ms | 32.40 ms |
+| 1000 | **57,522 req/s** | 16.80 ms | 59.18 ms |
+| 2000 | 47,171 req/s | 41.41 ms | 125.64 ms |
 
 ### 多场景 Summary
 
 | 场景 | 配置 | 吞吐量 | P50 |
 |------|------|--------|-----|
-| 动态路由 (Hello World) | 100 conn × 10s | **49,587 req/s** | 1.98 ms |
-| 静态文件 (LRU 缓存命中) | 100 conn × 10s | **61,839 req/s** | 1.64 ms |
-| 高并发 | 2000 conn × 10s | **24,972 req/s** | 78.42 ms |
-| ab -k (keep-alive) | 2000 req × 50 conn | 9,789 req/s | 0 失败 |
+| 动态路由 (Hello World) | 100 conn × 10s | 41,315 req/s | 2.39 ms |
+| 静态文件 (LRU 缓存命中) | 100 conn × 10s | **62,188 req/s** | 1.62 ms |
+| 大文件 300KB (sendfile 零拷贝) | 100 conn × 10s | 14,350 req/s | 6.56 ms |
 
-> **稳定性**: 本次整理全量测试累计 **250 万+ 请求**零错误；ASan/UBSan 下混合流量（并发 + 错误请求 + 静态文件）零内存错误；SIGINT 优雅关闭排空活跃连接后干净退出。
+> **稳定性**: 25 项协议测试 + 22 项功能回归全部通过；ASan/UBSan 下 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零内存错误；`--max-queue-size 1` 实测触发 503 背压；SIGTERM 压测中优雅关闭: 在途大文件响应完整送达（逐字节校验）、排空期请求正常响应并关闭连接、活跃连接归零后 0.1s 内退出。
 >
-> **瓶颈分析**: 4 核 CPU 极限下饱和吞吐约 5 万 req/s，延迟随并发线性增长（线程池排队效应），符合 Reactor 模型预期。
+> **瓶颈分析**: 吞吐峰值约 5.7 万 req/s（1000 并发），延迟随并发线性增长（线程池排队效应），符合 Reactor 模型预期。
 
 ## 演进路线
 
@@ -170,6 +168,8 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 | 11 | 6 项 BugFix | **P0** TimerQueue `addTimer`/`cancel` 加 `assert(isInLoopThread())`; EPOLLRDHUP/EPOLLERR→errorCallback→handleClose; Buffer::append 指数扩容 (cap×2); ThreadPool `running_` `bool→atomic<bool>`; Log stdout 去 flush (行缓冲 `\n` 自动刷) |
 | 12 | 压测 + 文档 | 并发-吞吐量曲线, 多场景 wrk, 零错误压测 |
 | 13 | 整理 + 修复 | HEAD 等价 GET (RFC 7231), 请求头大小限制 (→413 防 DoS), Connection: close 尊重 (RFC 7230), max_connections 配置键修复, 文档/CI/License 完善 |
+| 14 | 全量回归 + 修复 | TimerQueue 重构为自实现最小堆 (`timerHeap_` + `id2index_`); Router 参数模式跳过精确/`pathToMethods_` 查找 (`/user/%3Aid` 解码命中 404 bug); Content-Length 大小写不敏感 + 全数字校验 + body 16MB 上限 (防请求走私/DoS); getHeader 大小写不敏感; 404/413 分支补齐; `-m` 短参数 |
+| 15 | 排空修复 | SIGTERM 后排空期请求静默丢弃 (客户端挂起超时) → 改为请求照常处理 + 响应强制 `Connection: close`; 在途响应完整送达, 连接归零即退出 |
 
 ## 项目结构
 
@@ -233,8 +233,8 @@ ET 模式下每个事件只通知一次，必须循环读到 EAGAIN。好处是�
 
 ## 已知局限
 
-- HTTP 协议仅支持 GET/POST/HEAD，不支持 chunked transfer-encoding、pipeline
-- URL 解码仅支持 `%xx` 与 `+`，不支持 UTF-8 规范化
+- HTTP 协议仅支持 GET/POST/HEAD，不支持 chunked transfer-encoding
+- URL 解码仅支持 `%xx` 与 `+`→空格，非法编码原样保留，不支持 UTF-8 规范化
 - 线程池队列满时返回 503，无复杂背压策略
 - 无 SSL/TLS
 - 无 HTTP/2、WebSocket

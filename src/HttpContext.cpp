@@ -3,6 +3,7 @@
 #include<iomanip>
 #include<cstring>
 #include<error.h>
+#include<strings.h>  // strcasecmp
 
 static int hexVal(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -96,7 +97,15 @@ bool HttpContext::parseRequest(Buffer* buf)
     }
 
     if(state_ == kExpectBody){
-        if (buf->readableBytes() < contentLength_) return false;  // 数据不够
+        if (buf->readableBytes() < contentLength_) {
+            // 数据未到齐也要先检查声明长度：Content-Length 可声明任意大小，
+            // 不提前拦截会无界吃内存（DoS）。声明超限 → 413，不必等数据到齐
+            if (contentLength_ > kMaxBodyBytes) {
+                error_ = kHeaderTooLarge;
+                return false;
+            }
+            return false;  // 数据不够
+        }
         request_.setBody(buf->retrieve(contentLength_));
         state_ = KGotCompleteRequest;
     }
@@ -167,13 +176,22 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
         return false;
     }
     std::string key = line.substr(0,colon);
+    // 头名尾部空白 trim（RFC 7230 §3.2.4）："Connection : close" 的 key 是 "Connection "
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
     size_t valBegin = colon + 1;
 
     if (valBegin < line.size() && line[valBegin] == ' ') valBegin++;  // 跳过 ": " 的空格
     std::string value = line.substr(valBegin);
 
     req->addHeader(key, value);
-    if (key == "Content-Length"){
+    // 头名大小写不敏感（RFC 7230 §3.2）：content-length: 也必须识别，
+    // 否则小写变体下 contentLength_ 恒为 0，body 被当新请求行解析（错位）
+    if (strcasecmp(key.c_str(), "Content-Length") == 0){
+        // 必须全数字：stoul 前缀解析会把 "5abc" 当 5（请求走私风险）
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+            error_ = kBadRequest;
+            return false;
+        }
         try{
             contentLength_ = std::stoul(value);
         }catch(const std::exception& e){
@@ -181,7 +199,7 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
             return false;
         }
     }
-        
+
 
     return true;
 }

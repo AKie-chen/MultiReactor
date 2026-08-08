@@ -11,6 +11,8 @@ public:
     // 头部大小上限（防止无界内存消耗）：单行 8KB、累计 64KB，超出 → 413
     static constexpr size_t kMaxHeaderLine = 8 * 1024;
     static constexpr size_t kMaxHeaderBytes = 64 * 1024;
+    // 请求体大小上限（防内存 DoS：Content-Length 可声明任意大小），超出 → 413
+    static constexpr size_t kMaxBodyBytes = 16 * 1024 * 1024;
 
     HttpContext();
 

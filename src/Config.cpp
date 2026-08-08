@@ -32,7 +32,7 @@ bool ConfigParser::parse(int argc, char* argv[], ServerConfig& cfg)
             if (i + 1 < argc) cfg.workerThreads = std::atoi(argv[++i]);
         } else if (arg == "--static-dir" || arg == "-d") {
             if (i + 1 < argc) cfg.staticDir = argv[++i];
-        } else if (arg == "--max-file-size") {
+        } else if (arg == "--max-file-size" || arg == "-m") {  // -m 与帮助文本一致
             if (i + 1 < argc) cfg.maxFileSizeMB = std::atoi(argv[++i]);
         } else if (arg == "--timeout" || arg == "-t") {
             if (i + 1 < argc) cfg.connectionTimeoutSec = std::atoi(argv[++i]);
