@@ -47,7 +47,7 @@ epoll_wait → Channel::handleEvent
 | HTTP | GET/POST/HEAD, Content-Length, 状态机, HEAD 等价 GET (RFC 7231), Connection 头 (RFC 7230) |
 | 错误处理 | 400/403/404/405/413/500/505, 按错误分类 |
 | 路由 | 精确匹配 + 参数化 (`/user/:id`) + 通配符 (`*`) |
-| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存, 304 协商缓存, 目录→index.html |
+| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存 (≤64KB), sendfile 零拷贝 (>64KB), 304 协商缓存, 目录→index.html |
 | 定时器 | timerfd + CLOCK_MONOTONIC, O(log n) cancel, 可配置超时 |
 | 日志 | 结构化输出, 5 级过滤, 时间戳 + 文件:行号 |
 | 信号 | SIGINT/SIGTERM 优雅关闭 (排空), eventfd 集成到 epoll |
@@ -222,6 +222,9 @@ ET 模式下每个事件只通知一次，必须循环读到 EAGAIN。好处是�
 ### 为什么 realpath 而不是字符串禁止 `..`？
 字符串黑名单可被 `//`、`%2e%2e`、符号链接绕过。`realpath` 解析规范路径后做前缀比较，同时验证文件存在性，一次系统调用解决两个问题。
 
+### 为什么大文件用 sendfile、小文件用内存缓存？
+静态文件分两条路径：`> 64KB` 走 `sendfile(2)` 零拷贝——文件数据在内核态从 page cache 直接 DMA 到网卡，不经过用户态缓冲（省一次 read + write 的用户态/内核态切换和拷贝）；`≤ 64KB` 走 LRU 内存缓存——高频小文件请求避免重复 open/close/read 系统调用（实测 100 并发静态文件 61.8k req/s 即受益于此）。headers 与文件体分开发送：`send(2)` 先发响应头，`sendfile(2)` 再发文件体，两者可分别阻塞等待 EPOLLOUT。细节见 `TcpConnection::handleWrite` 的 SendItem 队列。
+
 ### 为什么 Metrics 用 atomic 而不是加锁？
 6 个计数器分布在 5 个线程中并发写入，`std::atomic<uint64_t>` 的 `fetch_add` 在 x86 上是单条 `LOCK INC` 指令，比 mutex 快一个数量级。读取 `/stats` 时也不需要等锁。
 
@@ -234,7 +237,6 @@ ET 模式下每个事件只通知一次，必须循环读到 EAGAIN。好处是�
 - URL 解码仅支持 `%xx` 与 `+`，不支持 UTF-8 规范化
 - 线程池队列满时返回 503，无复杂背压策略
 - 无 SSL/TLS
-- 无 sendfile/mmap 零拷贝（静态文件用 read + write）
 - 无 HTTP/2、WebSocket
 - 路由支持精确/参数化/通配符，但不支持正则
 - 指标无延迟分位数（histogram）

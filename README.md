@@ -19,7 +19,7 @@
 | HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive, 状态机解析 (跨 TCP 拆包) |
 | 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 505, 按错误分类 |
 | 路由 | 精确匹配 (method + path) + 参数化路由 (`/user/:id`) + 通配符 |
-| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存, 304 协商缓存, 大文件流式发送 |
+| 静态文件 | MIME 映射, realpath 路径穿越防护, LRU 内容缓存 (≤64KB), 304 协商缓存, sendfile 零拷贝 (>64KB) |
 | 定时器 | timerfd + CLOCK_MONOTONIC, O(log n) 取消, 空闲连接超时 |
 | 日志 | 5 级过滤, 时间戳 + 文件:行号 |
 | 信号 | SIGINT/SIGTERM 优雅关闭: 停止 accept → 排空活跃连接 → 退出 |
@@ -192,7 +192,6 @@ main
 - HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding、URL 半角解码仅限 `%xx`、无 pipeline
 - 线程池队列满时返回 503，无复杂背压策略
 - 无 SSL/TLS、无 HTTP/2、无 WebSocket
-- 静态文件使用 read + write 流式发送，未用 sendfile 零拷贝
 - 路由不支持正则，仅精确匹配 + `:param` + `*` 通配
 - 指标无延迟分位数 histogram
 
