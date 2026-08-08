@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <ctime>
 #include <mutex>
+#include <cstdlib>   // abort()
 
 // 静态成员初始化
 LogLevel Logger::minLevel_ = LogLevel::DEBUG;
@@ -17,6 +18,11 @@ LogStream::LogStream(LogLevel level, const char* file, int line)
 LogStream::~LogStream() {
     if (!moved_) {
         Logger::write(level_, file_, line_, buf_.str());
+        // FATAL 语义（muduo 风格）：日志输出后立即终止进程。
+        // 带病继续跑只会掩盖错误——例如 bind 失败后静默启动、
+        // 永不 accept（实测）。用 abort 而非 exit：以信号中止，
+        // 不走析构不清栈，保证"启动失败"绝对可见
+        if (level_ == LogLevel::FATAL) abort();
     }
 }
 

@@ -45,6 +45,15 @@ void Channel::enableWriting() // 使能可写事件
     added_ = true; // 标志Channel对象已经添加到epoll中
 }
 
+void Channel::disableReading() // 禁止可读事件
+{
+    if(added_){
+        events_ &= ~EPOLLIN; // 从关注的事件类型中移除EPOLLIN事件
+        data_.ptr = this;   // 将Channel对象的指针存储在事件数据中，以便在事件发生时能够获取到对应的Channel对象
+        loop_->updateChannel(this,EPOLL_CTL_MOD); // 更新Channel对象在epoll中的事件
+    }
+}
+
 void Channel::disableWriting() // 禁止可写事件
 {
     if(added_){

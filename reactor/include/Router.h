@@ -27,7 +27,6 @@ private:
         HttpRequest::Method method;
         std::string path;
         bool operator<(const RouteKey& other) const;  // 用于 map key
-        bool operator==(const RouteKey& other) const; // 用于 unordered_map key
     };
     std::map<RouteKey, Handler> routes_;  // 使用 std::map 以便按 method 和 path 排序
     std::unordered_map<std::string, std::set<HttpRequest::Method>> pathToMethods_;  // 用于快速查找路径对应的支持方法

@@ -11,7 +11,7 @@ struct ServerConfig{
     bool keepAlive = true; // 是否开启长连接
     size_t maxConnections = 10000; // 最大连接数
     int keepAliveIdleSec = 7200; // 长连接空闲时间(两小时)
-    int maxQueueSize = 100; // 线程池队列最大长度
+    int maxQueueSize = 1024; // 线程池队列最大长度
 
     // 线程
     size_t ioThreads = 4;

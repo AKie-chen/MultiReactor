@@ -99,6 +99,8 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
         resp->setStatusCode(HttpResponse::k200Ok);
         resp->addHeader("Content-Type", getMimeType(indexResolved)); // 用实际文件(index.html)判定 MIME，目录路径无扩展名
         resp->addHeader("Content-Length", std::to_string(st.st_size));
+        resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+        resp->addHeader("Cache-Control", "public, max-age=60");
 
         return true;
     }
@@ -122,21 +124,27 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
     // 6. 小文件走缓存
     if(st.st_size <= kCacheThreshold) {
         // 先查缓存
-        {        
+        {
             std::lock_guard<std::mutex> lock(mtx_);  // 保护 cacheMap_ 和 lruList_
             auto it = cacheMap_.find(resolved);
-            if (it != cacheMap_.end() && it->second.mtime == st.st_mtime) {  // ← mtime 失效检查
-                resp->setBody(it->second.content);        // 直接给内存里的内容,不读磁盘
-                // 更新 LRU:erase 旧迭代器 + push_front + 更新 lruIt
+            if (it != cacheMap_.end()) {
+                if (it->second.mtime == st.st_mtime) {  // 缓存命中
+                    resp->setBody(it->second.content);        // 直接给内存里的内容,不读磁盘
+                    // 更新 LRU:erase 旧迭代器 + push_front + 更新 lruIt
+                    lruList_.erase(it->second.lruList_);
+                    lruList_.push_front(resolved);
+                    it->second.lruList_ = lruList_.begin();
+                    resp->setStatusCode(HttpResponse::k200Ok);
+                    resp->addHeader("Content-Type", getMimeType(resolved));
+                    resp->addHeader("Content-Length", std::to_string(it->second.content.size()));
+                    resp->addHeader("Last-Modified", httpDate(st.st_mtime));
+                    resp->addHeader("Cache-Control", "public, max-age=60");
+                    return true;
+                }
+                // mtime 失效：彻底移除旧 entry（map + list 同步清），
+                // 否则 list 残留旧节点，缓存满时会把刚更新的新 entry 错误淘汰
                 lruList_.erase(it->second.lruList_);
-                lruList_.push_front(resolved);
-                it->second.lruList_ = lruList_.begin();
-                resp->setStatusCode(HttpResponse::k200Ok);
-                resp->addHeader("Content-Type", getMimeType(resolved));
-                resp->addHeader("Content-Length", std::to_string(it->second.content.size()));
-                resp->addHeader("Last-Modified", httpDate(st.st_mtime));
-                resp->addHeader("Cache-Control", "public, max-age=60");
-                return true;
+                cacheMap_.erase(it);
             }
         }
 

@@ -71,19 +71,24 @@ RouterResult Router::route(const HttpRequest& req, HttpResponse* resp, std::map<
     }
 
     // 如果路径不存在，检查动态路由
+    // 注意：同一模式注册多个方法时 paramRoutes_ 会有多个 entry（addRoute 每次追加一个）。
+    // 某个 entry 模式匹配但方法不匹配时不能立即返回 405——后面的 entry 可能有匹配的方法
+    // （如 GET /user/:id 和 POST /user/:id 分开注册时，POST 请求必须命中第二个 entry）。
+    // 先全部遍历找方法匹配的，找不到再回退 405。
+    bool patternMatchedButMethodNot = false;
     for (const auto& paramRoute : paramRoutes_) {
         if (matchPattern(paramRoute.first, req.path(), params)) {
+            patternMatchedButMethodNot = true;
             auto methodIt = paramRoute.second.find(req.method());
             if (methodIt != paramRoute.second.end()) {
                 methodIt->second(req, resp, *params);  // handler 第三参就是 :id 提取出的值
                 return RouterResult::kFound;
             }
-            // 模式匹配上了，但方法不支持 → 405
-            return RouterResult::kMethodNotAllowed;
+            // 方法不匹配：记住，继续找下一个 entry
         }
-        // 模式没匹配上 → 继续试下一个动态路由
     }
 
+    if (patternMatchedButMethodNot) return RouterResult::kMethodNotAllowed;
     return RouterResult::kNotFound;
 }
 
@@ -91,7 +96,3 @@ bool Router::RouteKey::operator<(const RouteKey& other) const {
     if (method != other.method) return method < other.method;
     return path < other.path;
 }
-
-bool Router::RouteKey::operator==(const RouteKey& other) const { // 用于 unordered_map key
-    return method == other.method && path == other.path;
-} 
