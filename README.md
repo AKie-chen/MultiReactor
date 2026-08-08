@@ -1,6 +1,6 @@
-# Reactor
+# MultiReactor
 
-[![CI](https://github.com/AKie-chen/LearningReactor/actions/workflows/ci.yml/badge.svg)](https://github.com/AKie-chen/LearningReactor/actions/workflows/ci.yml)
+[![CI](https://github.com/AKie-chen/MultiReactor/actions/workflows/ci.yml/badge.svg)](https://github.com/AKie-chen/MultiReactor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)]()
@@ -39,8 +39,8 @@
 ### 构建
 
 ```bash
-git clone https://github.com/AKie-chen/LearningReactor.git
-cd LearningReactor
+git clone https://github.com/AKie-chen/MultiReactor.git
+cd MultiReactor
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
@@ -49,16 +49,16 @@ cmake --build build -j$(nproc)
 
 ```bash
 # 默认配置: 端口 8080, 4 IO 线程, 4 工作线程, 超时 10s, 静态目录 ./static
-./build/main
+./build/multireactor
 
 # 命令行参数
-./build/main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
+./build/multireactor -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
 
 # 配置文件 + CLI 覆盖 (CLI 优先级更高)
-./build/main -c server.conf -p 9090
+./build/multireactor -c server.conf -p 9090
 
 # 查看全部选项
-./build/main -h
+./build/multireactor -h
 ```
 
 ### 命令行参数
@@ -140,7 +140,7 @@ wrk -t4 -c100 -d10s http://127.0.0.1:8080/
 ## 项目结构
 
 ```
-LearningReactor/
+MultiReactor/
 ├── include/                  # 头文件
 │   ├── EventLoop.h           # epoll 事件循环 (主线程 + 子线程)
 │   ├── Channel.h             # fd + events + 回调 抽象

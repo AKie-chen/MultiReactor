@@ -39,7 +39,7 @@ jobs:
 
       - name: Smoke test
         run: |
-          ./build/main -p 18080 -i 2 -w 4 -d . -t 10 --log-level INFO &
+          ./build/multireactor -p 18080 -i 2 -w 4 -d . -t 10 --log-level INFO &
           SERVER_PID=$!
           sleep 2
           # 基础路由

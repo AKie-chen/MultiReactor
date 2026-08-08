@@ -1,4 +1,4 @@
-# Reactor — 架构详解与设计决策
+# MultiReactor — 架构详解与设计决策
 
 基于 Linux epoll ET 模式从零构建的 C++17 高性能 HTTP 服务器。本文档记录 13 步迭代（功能 + 稳定性/性能修复），每个优化对应独立的功能增量。
 
@@ -77,16 +77,16 @@ cmake --build build -j$(nproc)
 
 ```bash
 # 默认配置 (端口 8080, 4 IO 线程, 4 工作线程, 超时 10s)
-./build/main
+./build/multireactor
 
 # 命令行参数
-./build/main -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
+./build/multireactor -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
 
 # 配置文件 + CLI 覆盖 (CLI 优先级高于文件)
-./build/main -c server.conf -p 9090
+./build/multireactor -c server.conf -p 9090
 
 # 查看全部选项
-./build/main -h
+./build/multireactor -h
 ```
 
 ### 配置文件格式
@@ -174,7 +174,7 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 ## 项目结构
 
 ```
-LearningReactor/
+MultiReactor/
 ├── include/
 │   ├── Acceptor.h              # listenfd 封装, accept 循环
 │   ├── Buffer.h                # 非连续缓冲区 (readv)
