@@ -31,9 +31,10 @@ public:
     std::string headersToString() const; // 将响应头部转换为字符串形式
 
     void setFileBody(const std::string& filepath, off_t size); // 设置文件作为响应体
-    bool isFileBody() const; // 判断是否使用文件作为响应体
-    const std::string& fileBodyPath() const; // 获取文件路径
-    off_t fileBodySize() const; // 获取文件大小
+    bool isFileBody() const { return isFileBody_; }; // 判断是否使用文件作为响应体
+    const std::string& fileBodyPath() const { return fileBodyPath_; }; // 获取文件路径
+    off_t fileBodySize() const { return fileBodySize_; }; // 获取文件大小
+    off_t fileBodyOffset() const { return fileBodyOffset_; }; // 获取文件偏移量
 
 private:
     HttpStatusCode statusCode_;// 状态码
@@ -44,4 +45,5 @@ private:
     bool isFileBody_ = false; // 标记是否使用文件作为响应体
     std::string fileBodyPath_; // 文件路径
     off_t fileBodySize_ = 0; // 文件大小
+    off_t fileBodyOffset_ = 0; // 文件偏移量
 };

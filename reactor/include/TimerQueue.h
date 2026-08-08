@@ -44,9 +44,6 @@ private:
     struct HeapEntry{
         int64_t expiration; // 过期时间（微秒）
         int64_t timerId;    // 定时器 ID
-        bool operator<(const HeapEntry& other) const {
-            return expiration != other.expiration ? expiration > other.expiration : timerId > other.timerId;
-        }
     };
 
     std::vector<HeapEntry> timerHeap_; // 小顶堆，按 expiration 升序排列

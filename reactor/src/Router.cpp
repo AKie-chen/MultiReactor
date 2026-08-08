@@ -21,7 +21,8 @@ static bool matchPattern(const std::string& pattern, const std::string& path,
     auto patternSegments = splitPath(pattern);
     auto pathSegments = splitPath(path);
 
-    if (patternSegments.size() != pathSegments.size()) {
+    // pattern比path长不必匹配
+    if (patternSegments.size() > pathSegments.size()) {
         return false;
     }
 
@@ -33,6 +34,10 @@ static bool matchPattern(const std::string& pattern, const std::string& path,
             if (param) {
                 (*param)[pSeg.substr(1)] = pathSeg; // 提取参数值
             }
+        } else if (!pSeg.empty() && pSeg[0] == '*') { // 通配符
+            // 必须放在相等比较之前：`*` 与任意路径段都不等，
+            // 放后面会被 pSeg != pathSeg 提前 return false（原实现 bug）
+            return true; // 贪婪匹配剩余所有段（含 0 段以上）
         } else if (pSeg != pathSeg) { // 静态部分不匹配
             return false;
         }

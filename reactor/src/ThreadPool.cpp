@@ -35,6 +35,7 @@ bool ThreadPool::tryRun(Task task)//提交任务，非阻塞
         tasks_.push(std::move(task));
     }
     cond_.notify_one(); // 唤醒一个等待的线程
+    inFlight_++;
     return true;
 }
 
@@ -56,5 +57,6 @@ void ThreadPool::workerLoop() //每个工作的线程
             tasks_.pop();
         }
         task();  // 在锁外执行，不阻塞其他线程取任务
+        inFlight_--; // 任务执行完毕
     }
 }

@@ -36,25 +36,29 @@ int main(int argc, char* argv[]) {
     // shared_ptr）导致泄漏（LSAN 实测 80B）
     std::function<void()> drainCheck;
 
+    std::atomic<bool> isShutdown(false);
     SignalHandler signalHandler(&loop);
     signalHandler.addSignal(SIGINT);
     signalHandler.addSignal(SIGTERM);
-    signalHandler.setShutdownCallback([&loop, &server, &drainCheck]() {
+    signalHandler.setShutdownCallback([&loop, &server, &drainCheck, &isShutdown, &threadPool]() {
         LOG_INFO << "Graceful shutdown: stop accepting, draining connections...";
 
         // 1. 只停监听：关闭 acceptor，不再接受新连接（现有连接继续服务完毕）
         server.stopAccepting();
+        isShutdown.store(true);
 
         // 2. 每 100ms 检查一次活跃连接数，归零或超 10s 则退出主循环
         timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
         int64_t deadline = (ts.tv_sec * 1'000'000 + ts.tv_nsec / 1'000) + 10 * 1'000'000;
 
-        drainCheck = [&loop, deadline, &drainCheck]() {
+        drainCheck = [&loop, deadline, &drainCheck, &threadPool]() {
             int64_t active = Metrics::instance().activeConnections.load();
             timespec t2; clock_gettime(CLOCK_MONOTONIC, &t2);
             int64_t now = t2.tv_sec * 1'000'000 + t2.tv_nsec / 1'000;
             LOG_DEBUG << "drain check: active=" << active << " now=" << now << " deadline=" << deadline;
-            if (active == 0 || now >= deadline) {
+            if ((active == 0 && threadPool.inFlight() == 0) || now >= deadline) {
+                // 兜底必须短路：deadline 到了无论还有没有在途任务都要退出，
+                // 否则 & 绑定下 deadline 变成"再等 100ms"，10s 保证失效（可能永远挂住）
                 loop.quit();   // 现在才退出主循环。注意不能提前 quit()：
                                // loop() 的 while 条件在顶部，提前 quit 本迭代结束就退出，
                                // 之后 addTimer 的检查永远不会再触发（原实现的坑）
@@ -94,6 +98,7 @@ int main(int argc, char* argv[]) {
     });
 
 
+
     auto resetTimer = [&cfg](TcpConnection::ptr conn) {
         if (conn->timerId() != 0) {
             conn->getLoop()->timerQueue().cancel(conn->timerId());
@@ -123,8 +128,11 @@ int main(int argc, char* argv[]) {
         });
     });
 
-    server.setMessageCallback([&resetTimer, &threadPool, &router, &staticHandler]
+    server.setMessageCallback([&resetTimer, &threadPool, &router, &staticHandler, &isShutdown]
                               (TcpConnection::ptr conn, Buffer* buf) {
+        // 关闭连接,不再接受请求
+        if(isShutdown) { conn->markForClose(); return; }
+
         HttpContext& ctx = conn->context();
 
         // 解析请求（解析状态累积在 ctx 内部，TCP 拆包时多次 EPOLLIN 之间不丢失）

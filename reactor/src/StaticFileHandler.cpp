@@ -187,7 +187,6 @@ bool StaticFileHandler::handle(const HttpRequest& req, HttpResponse* resp)
     resp->addHeader("Content-Length", std::to_string(st.st_size));
     resp->addHeader("Last-Modified", httpDate(st.st_mtime));
     resp->addHeader("Cache-Control", "public, max-age=60");
-    resp->addHeader("Accept-Ranges", "bytes"); // 支持断点续传
     return true;
 }
 

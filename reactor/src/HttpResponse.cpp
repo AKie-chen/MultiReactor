@@ -137,18 +137,3 @@ void HttpResponse::setFileBody(const std::string& filepath, off_t size) // 设�
     fileBodyPath_ = filepath;
     fileBodySize_ = size;
 }
-
-bool HttpResponse::isFileBody() const // 判断是否使用文件作为响应体
-{
-    return isFileBody_;
-}
-
-const std::string& HttpResponse::fileBodyPath() const // 获取文件路径
-{
-    return fileBodyPath_;
-}
-
-off_t HttpResponse::fileBodySize() const // 获取文件大小
-{
-    return fileBodySize_;
-}
