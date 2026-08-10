@@ -1,7 +1,6 @@
 #pragma once
 #include "Channel.h"
 #include "Buffer.h"
-#include "Timer.h"
 #include "HttpContext.h"
 #include "HttpResponse.h"
 #include <string>

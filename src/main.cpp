@@ -16,6 +16,8 @@
 #include "Config.h"
 #include "Metrics.h"
 #include <string>
+#include <sys/resource.h>
+#include <cstring>
 
 int main(int argc, char* argv[]) {
     ServerConfig cfg;
@@ -25,6 +27,28 @@ int main(int argc, char* argv[]) {
     }
 
     Logger::setLevel(LogLevel(Logger::parseLogLevel(cfg.logLevel)));
+
+    // fd 上限处理（fd 耗尽是真实故障源：accept 返回 EMFILE + epoll 忙循环，
+    // 见 Acceptor::handleRead 的 EMFILE 排空逻辑）：
+    // 1. 软上限提到硬上限，让进程可用 fd 最大化
+    // 2. maxConnections 与 fd 上限联动：连接 fd 之外还有 listen/epoll/eventfd/
+    //    timerfd/日志/sendFile 等固定消耗，预留余量，防止 maxConnections 远大于
+    //    ulimit 时连接数没到上限就撞上 EMFILE
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            LOG_WARN << "setrlimit(RLIMIT_NOFILE) to " << rl.rlim_max << " failed: " << strerror(errno);
+        }
+        const size_t kFdReserve = 64; // 给 listen/epoll/eventfd/timerfd/日志/sendFile 预留
+        size_t fdCap = rl.rlim_cur > kFdReserve ? static_cast<size_t>(rl.rlim_cur - kFdReserve) : 0;
+        if (cfg.maxConnections > fdCap) {
+            LOG_WARN << "maxConnections " << cfg.maxConnections << " exceeds fd limit "
+                     << rl.rlim_cur << ", clamped to " << fdCap;
+            cfg.maxConnections = fdCap;
+        }
+    }
+
     EventLoop loop;
     TcpServer server(&loop, cfg.port, cfg.ioThreads);
     ThreadPool threadPool(cfg.workerThreads, cfg.maxQueueSize);

@@ -1,8 +1,6 @@
 #include "HttpContext.h"
 #include<algorithm>
-#include<iomanip>
 #include<cstring>
-#include<error.h>
 #include<strings.h>  // strcasecmp
 
 static int hexVal(char c) {

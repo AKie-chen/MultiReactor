@@ -1,7 +1,4 @@
 #pragma once
-#ifndef CHANNEL_H
-#define CHANNEL_H
-
 #include <sys/epoll.h>
 #include <functional>
 #include <cstdint>
@@ -38,5 +35,3 @@ public:
     void disableWriting(); // 禁止可写事件
     void disableAll();    // 移除所有事件监听，从 epoll 中删除
 };
-
-#endif

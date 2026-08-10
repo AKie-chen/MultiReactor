@@ -9,7 +9,6 @@
 
 EventLoop::EventLoop()
     : looping_(false),
-      quit_(false),
       epfd_(epoll_create1(0)),
       wakeupFd_(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
       wakeupChannel_(wakeupFd_, this),
@@ -44,8 +43,6 @@ void EventLoop::loop() {
             LOG_DEBUG << "epoll_wait timeout, no events";
         }else if(react==-1){
             if(errno==EINTR){ continue; }// 被信号中断，继续等待事件
-        }else{
-            LOG_ERROR << "epoll_wait error: " << strerror(errno);
         }
         
         std::vector<std::function<void()>> temp; // 供销毁的vector
@@ -62,7 +59,6 @@ void EventLoop::loop() {
 }
 
 void EventLoop::quit() {
-    quit_ = true;
     looping_ = false;
     wakeup(); // 唤醒事件循环，使其退出
 }

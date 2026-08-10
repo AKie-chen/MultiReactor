@@ -6,14 +6,12 @@
 #include <functional>
 #include <mutex>
 #include <thread>
-
-class Channel;
+#include <atomic>
 
 class EventLoop {
 private:
     int epfd_; // epoll实例的文件描述符
-    bool looping_; // 事件循环是否正在运行
-    bool quit_; // 退出事件循环的标志
+    std::atomic<bool> looping_; // 事件循环是否正在运行
     int wakeupFd_; // 用于唤醒事件循环的文件描述符
     Channel wakeupChannel_; // 用于唤醒事件循环的Channel对象
     std::mutex mutex_; // 互斥锁，用于保护共享数据

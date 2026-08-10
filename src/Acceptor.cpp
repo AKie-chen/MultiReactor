@@ -7,6 +7,7 @@
 Acceptor::Acceptor(EventLoop* loop, uint16_t port)
             :loop_(loop),
             listenfd_(socket(AF_INET,SOCK_STREAM,0)), 
+            idlefd_(::open("/dev/null", O_RDONLY | O_CLOEXEC)), // 预留 1 个 fd，fd 耗尽时用于排空 accept 队列（Muduo 技巧）
             channel_(listenfd_,loop_)
 {
     // socket 失败:fd 为 -1,后续 bind 必然失败,直接中止并说明原因
@@ -38,6 +39,7 @@ void Acceptor::close() {
     if (listenfd_ >= 0) {
         channel_.disableAll();   // 同时停止监听：防止 close 后 epoll 残留事件再触发 accept 回调
         ::close(listenfd_);
+        ::close(idlefd_);
         listenfd_ = -1;
     }
 }
@@ -70,11 +72,22 @@ void Acceptor::handleRead()  //处理监听
         int client_fd;
 
         while((client_fd = accept(channel_.fd(), (sockaddr*)&client_addr, &client_len)) != -1){//循环接受连接，直到没有连接请求为止
-            newConnectionCallback_(client_fd,client_addr);//
+            newConnectionCallback_(client_fd,client_addr);
+            client_len = sizeof(client_addr);  // 每次重置：accept 会改写 addrlen
         }
 
-        if(errno != EAGAIN && errno != EWOULDBLOCK) {
-            LOG_ERROR << "accept error" << strerror(errno);
+        if (errno == EMFILE || errno == ENFILE) {
+            // fd 耗尽：腾出预留的 1 个 fd，accept 一个连接后立即关闭，
+            // 排空 backlog 一个位置使 listen fd 不再可读，打破 epoll 忙循环
+            ::close(idlefd_);
+
+            idlefd_ = ::accept(channel_.fd(), nullptr, nullptr);
+            if (idlefd_ >= 0) ::close(idlefd_);
+            idlefd_ = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            LOG_WARN << "fd exhausted, dropped a pending connection";
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            // EAGAIN/EWOULDBLOCK 是正常收尾（backlog 已排空），不是错误
+            LOG_ERROR << "accept error: " << strerror(errno);
         }
     });
     channel_.enableReading(); // 使能可读事件

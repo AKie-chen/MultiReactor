@@ -25,4 +25,5 @@ private:
     EventLoop* loop_;//事件循环
     Channel channel_;//监听channel
     NewConnectionCallback newConnectionCallback_;//新连接回调
+    int idlefd_; // fd耗尽时用于排空accept队列预留的fd
 };

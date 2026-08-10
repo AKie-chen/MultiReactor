@@ -4,7 +4,7 @@ HttpResponse::HttpResponse() : statusCode_(HttpStatusCode::k200Ok)
                              , statusMessage_("OK")
                              , body_()
                              , headers_()
-                             , closeConnection_(false) {}// 构造函数{}// 构造函数
+                             , closeConnection_(false) {}
 
 HttpResponse::~HttpResponse(){}// 析构函数
 
