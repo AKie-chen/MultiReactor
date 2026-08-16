@@ -115,6 +115,7 @@ void HttpContext::reset()//一个请求处理完，复位等待下一个
 {
     state_ = kExpectRequestLine;
     contentLength_ = 0;
+    contentLengthSeen_ = false;
     headerBytes_ = 0;
     error_ = kNoError;
     request_ = HttpRequest();  // 清空上一个请求的解析数据
@@ -182,6 +183,13 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
     std::string value = line.substr(valBegin);
 
     req->addHeader(key, value);
+    // RFC 7230 §3.3.1：不支持的 Transfer-Encoding → 501，绝不能静默忽略。
+    // 若把 chunked 请求当无 body 处理，chunked 帧剩余字节会被当新请求解析，
+    // 产生连锁 400 与响应错配（实测）；前置代理按 TE 解析时即为走私向量
+    if (strcasecmp(key.c_str(), "Transfer-Encoding") == 0) {
+        error_ = kNotImplemented;
+        return false;
+    }
     // 头名大小写不敏感（RFC 7230 §3.2）：content-length: 也必须识别，
     // 否则小写变体下 contentLength_ 恒为 0，body 被当新请求行解析（错位）
     if (strcasecmp(key.c_str(), "Content-Length") == 0){
@@ -190,11 +198,23 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
             error_ = kBadRequest;
             return false;
         }
+        size_t len;
         try{
-            contentLength_ = std::stoul(value);
+            len = std::stoul(value);
         }catch(const std::exception& e){
             error_ = kBadRequest;
             return false;
+        }
+        // RFC 7230 §3.3.2：重复 Content-Length 值冲突 → 400（走私向量：
+        // 前置代理取第一个值、本服务器取最后一个值）。同值重复可容忍
+        if (contentLengthSeen_) {
+            if (len != contentLength_) {
+                error_ = kBadRequest;
+                return false;
+            }
+        } else {
+            contentLength_ = len;
+            contentLengthSeen_ = true;
         }
     }
 

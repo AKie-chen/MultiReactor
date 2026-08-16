@@ -196,6 +196,14 @@ int main(int argc, char* argv[]) {
                 conn->markForClose();
                 ctx.reset();
                 return;
+            } else if (ctx.error() == HttpContext::kNotImplemented) { // 501 Not Implemented (Transfer-Encoding)
+                Metrics::instance().errors5xx++;
+                conn->send(HttpResponse::makeError(
+                    HttpResponse::k501NotImplemented,
+                    "Not Implemented").toString());
+                conn->markForClose();
+                ctx.reset();
+                return;
             }
         }
 
@@ -205,6 +213,12 @@ int main(int argc, char* argv[]) {
         Metrics::instance().totalRequests++;
         resetTimer(conn);
 
+        // 请求串行化（见 TcpConnection::processing_ 注释）：
+        // 提交前上锁，响应入队时在 queueInLoop lambda 里 endRequest() 解锁。
+        // 保证同一连接上响应与请求严格一一对应、顺序一致——
+        // 否则多线程池乱序完成会让流水线响应错配（实测 [200,400] → [400,400]），
+        // 且错误路径同步关连接会丢掉前序在途响应
+        conn->beginRequest();
         bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler, &isShutdown]() {
             HttpResponse resp;
 
@@ -250,6 +264,7 @@ int main(int argc, char* argv[]) {
                     conn->send(resp.toString(!isHead));
                 }
                 if (closeConn) conn->markForClose();
+                conn->endRequest();  // 解锁串行化，继续处理剩余流水线请求
             });
         });
 
@@ -270,6 +285,7 @@ int main(int argc, char* argv[]) {
             conn->getLoop()->queueInLoop([conn, resp, keepAlive]() {
                 conn->send(resp.toString());
                 if (!keepAlive) conn->markForClose(); // HTTP/1.0 无显式 keep-alive，保持原行为
+                conn->endRequest();
             });
         }
     });

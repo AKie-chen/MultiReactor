@@ -36,6 +36,10 @@ public:
     int64_t timerId() const { return timerId_; }
     void setTimerId(int64_t id) { timerId_ = id; }
 
+    // 请求串行化（见 processing_ 注释）：提交 worker 前调用，响应入队后调用 endRequest()
+    void beginRequest();
+    void endRequest();
+
     int fd() const;
     EventLoop* getLoop() const;
     void shutdown(); // 优雅关闭，停读，输出排空后自动关闭
@@ -50,6 +54,7 @@ private:
     std::atomic<bool> closed_{false};   // 防止 handleClose() 重入
 
     void handleRead();
+    void processBufferedRequests();  // 消费 buffer 中所有完整请求（串行化下每轮至多提交一个）
     void handleWrite();
     void handleClose();
     void destroy();  // 仅移除 epoll 监听，不 delete this
@@ -72,4 +77,9 @@ private:
     std::queue<SendItem> sendQueue_;  // 发送队列，保证顺序发送
     bool sending_ = false;  // 是否正在发送中，防止重复调用 handleWrite()
     bool closeAfterSend_ = false;  // 队列清空后关闭连接
+    // 同一连接同时最多一个请求在 worker 池中（仅 IO 线程访问）。
+    // 串行化的原因：多线程池乱序完成 → queueInLoop 入队顺序竞态 →
+    // 流水线响应与请求错配；且错误路径同步关连接会丢掉前序在途响应
+    // （实测：GET / + BOGUS 得到 [400,400] 而非 [200,400]）
+    bool processing_ = false;
 };

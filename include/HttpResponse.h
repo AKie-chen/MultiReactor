@@ -8,7 +8,8 @@ public:
     enum HttpStatusCode{ k200Ok = 200, k304NotModified = 304, k400BadRequest = 400, k403Forbidden = 403,
                         k404NotFound = 404, k405MethodNotAllowed = 405,
                         k413PayloadTooLarge = 413,
-                        k500InternalServerError = 500, k503ServiceUnavailable = 503,
+                        k500InternalServerError = 500, k501NotImplemented = 501,
+                        k503ServiceUnavailable = 503,
                         k505HttpVersionNotSupported = 505, };// http状态码枚举
 
     HttpResponse();// 构造函数

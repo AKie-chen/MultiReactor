@@ -23,6 +23,7 @@ TcpConnection::~TcpConnection()
 
 void TcpConnection::send(const std::string& data)
 {
+    if (closed_) return;  // 已关闭：响应晚到（worker 慢于超时强关），客户端不可达，丢弃
     Metrics::instance().bytesSent += data.size();
     sendQueue_.push({data, "", -1, 0, 0}); // 纯内存SendItem
     if(!sending_){
@@ -33,6 +34,7 @@ void TcpConnection::send(const std::string& data)
 
 void TcpConnection::sendFile(const std::string& headers,const std::string& filepath, off_t size)
 {
+    if (closed_) return;
     Metrics::instance().bytesSent += size;
     int fd = ::open(filepath.c_str(), O_RDONLY);
     if (fd < 0) {
@@ -100,18 +102,43 @@ void TcpConnection::handleRead()
 
     // ET 模式：一次 EPOLLIN 可能读到多个请求（keep-alive/pipelining），
     // 必须循环消费 buffer 中所有完整请求，否则剩余请求永远等不到新的 EPOLLIN
-    while (inputBuffer_.readableBytes() > 0 && !closed_) {
+    processBufferedRequests();
+
+    if (result == Buffer::kClosed) {
+        // 对端 FIN（半关闭）：请求已完整送达，已接收请求的响应必须回完再关。
+        // 直接 handleClose 会把在途 worker 响应丢弃（客户端挂起到空闲超时，
+        // 实测：发请求 + SHUT_WR 后收不到响应）。shutdown() = 停读 + 排空后自动关闭
+        shutdown();
+    } else if (result == Buffer::kError) {
+        handleClose();
+    }
+}
+
+void TcpConnection::processBufferedRequests()
+{
+    // processing_ 串行化：同一连接同时至多一个请求在 worker 池中。
+    // 多线程池下若同时处理多个流水线请求，完成顺序不确定 → queueInLoop
+    // 入队顺序竞态 → 响应错配（RFC 7230 §6.3.2 要求响应与请求一一对应保序）。
+    // 剩余请求在 endRequest() 里继续处理，顺序天然保持
+    while (!closed_ && !processing_ && inputBuffer_.readableBytes() > 0) {
         size_t oldLen = inputBuffer_.readableBytes();
         messageCallback_(shared_from_this(), &inputBuffer_);
         // parseRequest 没消费任何数据 = 请求不完整，等更多数据（下次 EPOLLIN）
         if (inputBuffer_.readableBytes() >= oldLen) break;
     }
+}
 
-    if (result == Buffer::kClosed) {
-        handleClose();
-    } else if (result == Buffer::kError) {
-        handleClose();
-    }
+void TcpConnection::beginRequest()
+{
+    processing_ = true;  // 请求提交到 worker：本连接暂停解析新请求
+}
+
+void TcpConnection::endRequest()
+{
+    // 响应已入发送队列：解除串行锁，继续处理 buffer 中剩余的流水线请求。
+    // 连接已关闭（超时强关等）时 closed_ 短路，不再解析
+    processing_ = false;
+    processBufferedRequests();
 }
 
 void TcpConnection::handleWrite()
@@ -164,8 +191,10 @@ void TcpConnection::handleWrite()
     // 队列空 → 关闭写事件
     sending_ = false;
     channel_.disableWriting();
-    // 短连接（HTTP/1.0）：所有数据发送完毕后关闭连接
-    if (closeAfterSend_) {
+    // 短连接（HTTP/1.0）：所有数据发送完毕后关闭连接。
+    // !processing_：还有请求在 worker 池中时不能关——它的响应尚未入队，
+    // 此刻关闭会把前序响应一起丢掉（实测：流水线 + 报错 → 响应错配）
+    if (closeAfterSend_ && !processing_) {
         handleClose();
     }
 }
@@ -198,9 +227,12 @@ void TcpConnection::shutdown() // 优雅关闭，停读，输出排空后自动�
 {
     channel_.disableReading(); //不在触发handleRead，拒绝新请求
     markForClose(); // 标记为关闭
-    if(sendQueue_.empty() && !sending_){ // 没有待发送数据
+    // 没有待发送数据且没有在途请求（worker 池中）才立即关：
+    // processing_ 为 true 时关闭会把 worker 尚未入队的响应一起丢掉
+    //（实测：半关闭 FIN 到达时请求刚提交 worker → 客户端收不到响应）
+    if(sendQueue_.empty() && !sending_ && !processing_){
         handleClose(); // 没有待发送数据，直接关闭
-    } 
+    }
 }
 
 void TcpConnection::destroy()

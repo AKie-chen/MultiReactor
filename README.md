@@ -16,9 +16,9 @@
 | I/O 模型 | epoll ET 边缘触发, 非阻塞 I/O, TCP_NODELAY, SO_KEEPALIVE, readv + 64KB extrabuf 循环读 |
 | 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 子线程, RR 分发）+ 有界队列工作线程池 |
 | 缓冲区 | prependable 三区模型, 指数扩容 |
-| HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive / pipelining, 状态机解析（跨 TCP 拆包累积） |
+| HTTP/1.1 | GET/POST/HEAD, Content-Length body, keep-alive / pipelining（每连接串行处理, 响应严格保序）, 状态机解析（跨 TCP 拆包累积） |
 | 解析健壮性 | 头名大小写不敏感（`Content-Length`/`connection:` 等变体均可识别）, 头名尾部空白 trim, Content-Length 全数字校验（拒绝 `5abc` 前缀解析）, body 声明超限立即 413 |
-| 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 505, 按错误分类; 413 触发: 请求行 >8KB / 头部累计 >64KB / body >16MB |
+| 错误处理 | 400 / 403 / 404 / 405 / 413 / 500 / 501 / 503 / 505, 按错误分类; 413 触发: 请求行 >8KB / 头部累计 >64KB / body >16MB; 重复 Content-Length 值冲突 → 400（RFC 7230 §3.3.2）; Transfer-Encoding → 501（不支持, 不静默忽略） |
 | 路由 | 精确匹配（method + path）+ 参数化（`/user/:id`）+ 通配符（`*`）; path 先 URL 解码（`%xx` + `+`→空格）后匹配, 连续斜杠折叠, 短 pattern 可匹配长 path |
 | 静态文件 | MIME 映射, realpath + 前缀检查路径穿越防护（穿越 → 403, 符号链接逃逸也拦截）, LRU 内容缓存（≤64KB, 256 条, mtime 失效）, >64KB sendfile 零拷贝, 304 协商缓存（仅 GET; HEAD 不协商）, 目录自动 index.html, POST/PUT 静态资源 → 404 |
 | 背压 | 线程池队列满 → 503 Service Unavailable; HTTP/1.1 下**不关连接**（拒绝后连接继续复用, 避免"拒绝→重连→更忙"风暴） |
@@ -199,7 +199,7 @@ main
 
 ## 已知局限
 
-- HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding
+- HTTP 仅支持 GET/POST/HEAD，无 chunked transfer-encoding（收到 Transfer-Encoding 头 → 501 拒绝）
 - URL 解码仅支持 `%xx` 与 `+`→空格, 非法编码原样保留
 - 无 SSL/TLS、无 HTTP/2、无 WebSocket
 - 路由不支持正则，仅精确匹配 + `:param` + `*` 通配
