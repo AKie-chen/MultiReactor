@@ -68,8 +68,6 @@ epoll_wait → Channel → TcpConnection::handleRead (ET 循环读)
 
 ## 踩坑记录（调试故事）
 
-每个问题都经过真实压测/工具复现，是面试"讲一个你解决的难题"的现成素材：
-
 | 现象 | 根因 | 修复（验证手段） |
 |------|------|------------------|
 | 流水线请求响应错配 `[200,400] → [400,400]` | 多 worker 乱序完成 + queueInLoop 入队竞态 | 每连接请求串行化（压测复现） |
@@ -140,8 +138,6 @@ Release，本机回环，wrk 5 轮 × 10s 取平均。
 - **CI**：GitHub Actions，gcc/clang × Release/Debug 四组矩阵构建 + 冒烟测试
 
 ## 当前边界与 Roadmap
-
-诚实清单（面试中被问到"缺点"时，这比背稿更可信）：
 
 - HTTP 仅 GET/POST/HEAD；无 chunked（TE → 501 显式拒绝）
 - 无 TLS / HTTP/2 / WebSocket；路由不支持正则
