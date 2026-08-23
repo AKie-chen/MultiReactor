@@ -11,7 +11,9 @@ static int hexVal(char c) {
 }
 
 // url解码函数，将%xx转为对应字符
-static std::string urlDecode(const std::string& src)
+// plusToSpace：仅 query 为 true（application/x-www-form-urlencoded 惯例，RFC 3986 §2.3
+// 之外的表单扩展）。path 中 + 是合法 pchar（sub-delims），必须保持字面量
+static std::string urlDecode(const std::string& src, bool plusToSpace)
 {
     std::string dest;
     dest.clear();
@@ -31,7 +33,7 @@ static std::string urlDecode(const std::string& src)
             } else {
                 dest += '%';
             }
-        } else if (src[i] == '+') {
+        } else if (src[i] == '+' && plusToSpace) {
             dest += ' ';
         } else {
             dest += src[i];
@@ -91,18 +93,26 @@ bool HttpContext::parseRequest(Buffer* buf)
             if(!parseHeader(line, &request_)) return false;
         }
 
+        // RFC 7230 §5.4：HTTP/1.1 请求必须带 Host，缺失 → 400（HTTP/1.0 不强制，RFC 1945）
+        if (request_.version() == "HTTP/1.1" && !hostSeen_) {
+            error_ = kBadRequest;
+            return false;
+        }
+
+        // 声明体长超限 → 立即 413，不必等 body 字节（Content-Length 可声明任意大小，
+        // 不提前拦截会无界吃内存（DoS））。放在状态转移前对 Expect: 100-continue 尤为关键：
+        // 必须先回最终状态码，绝不能先发 100 Continue 再反悔
+        if (contentLength_ > kMaxBodyBytes) {
+            error_ = kHeaderTooLarge;
+            return false;
+        }
+
         state_ = (contentLength_ > 0) ? kExpectBody : KGotCompleteRequest;
     }
 
     if(state_ == kExpectBody){
         if (buf->readableBytes() < contentLength_) {
-            // 数据未到齐也要先检查声明长度：Content-Length 可声明任意大小，
-            // 不提前拦截会无界吃内存（DoS）。声明超限 → 413，不必等数据到齐
-            if (contentLength_ > kMaxBodyBytes) {
-                error_ = kHeaderTooLarge;
-                return false;
-            }
-            return false;  // 数据不够
+            return false;  // 数据不够，等待更多数据
         }
         request_.setBody(buf->retrieve(contentLength_));
         state_ = KGotCompleteRequest;
@@ -116,6 +126,9 @@ void HttpContext::reset()//一个请求处理完，复位等待下一个
     state_ = kExpectRequestLine;
     contentLength_ = 0;
     contentLengthSeen_ = false;
+    hostSeen_ = false;
+    expectContinue_ = false;
+    continueSent_ = false;
     headerBytes_ = 0;
     error_ = kNoError;
     request_ = HttpRequest();  // 清空上一个请求的解析数据
@@ -145,11 +158,13 @@ bool HttpContext::parseRequestLine(std::string& line, HttpRequest* req)
 
         size_t queryPos = path.find('?');
         if (queryPos != std::string::npos) {
-            req->setQuery(path.substr(queryPos + 1));
-            req->setPath(urlDecode(path.substr(0, queryPos)));
+            // query 才做 application/x-www-form-urlencoded 的 + → 空格（RFC 3986 §2.3
+            // 之外的表单惯例）；%xx 解码与 path 相同
+            req->setQuery(urlDecode(path.substr(queryPos + 1), true));
+            req->setPath(urlDecode(path.substr(0, queryPos), false));  // path 中 + 保持字面量（RFC 3986）
         } else {
             req->setQuery("");
-            req->setPath(urlDecode(path));
+            req->setPath(urlDecode(path, false));
         }
     }else{
         error_ = kBadRequest;
@@ -218,6 +233,34 @@ bool HttpContext::parseHeader(std::string& line, HttpRequest* req)
         }
     }
 
+    // RFC 7230 §5.4 Host 头必须存在，否则 400
+    if (strcasecmp(key.c_str(), "Host") == 0) {
+        // 必须有值
+        if (value.empty()) {
+            error_ = kBadRequest;
+            return false;
+        }
+        // 第二个 Host 头冲突 → 400
+        if (hostSeen_){
+            error_ = kBadRequest;
+            return false;
+        }
+        hostSeen_ = true;
+    }
+
+    // RFC 7231 §5.1.1：Expect: 100-continue → 解析完头部后回 100 Continue；
+    // 其他 Expect 值无法满足 → 417，绝不能静默忽略——否则客户端会一直等 100 再发 body
+    if (strcasecmp(key.c_str(), "Expect") == 0) {
+        // 值允许带 OWS（RFC 7230 §3.2.4），比较前修剪首尾空白
+        std::string v = value;
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+        if (strcasecmp(v.c_str(), "100-continue") == 0) {
+            expectContinue_ = true;
+        } else {
+            error_ = kExpectationFailed;
+            return false;
+        }
+    }
 
     return true;
 }

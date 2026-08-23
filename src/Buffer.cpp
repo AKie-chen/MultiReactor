@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <cstring>
+#include <algorithm>
 #include <sys/uio.h>
 
 Buffer::Buffer()
@@ -19,7 +20,7 @@ Buffer::ReadResult Buffer::readFd(int fd)
         size_t writable = writeableBytes();
 
         iovec iov[2];
-        iov[0].iov_base = &buf_[writeIndex_];
+        iov[0].iov_base = buf_.data() + writeIndex_; // writable==0 时也安全：data()+size 是一端后指针，无 operator[] UB
         iov[0].iov_len  = writable;
         iov[1].iov_base = extrabuf;
         iov[1].iov_len  = sizeof(extrabuf);
@@ -38,6 +39,8 @@ Buffer::ReadResult Buffer::readFd(int fd)
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return kSuccess;
+            } else if (errno == EINTR) {
+                continue;
             } else {
                 return kError;
             }
@@ -55,6 +58,8 @@ Buffer::ReadResult Buffer::writeFd(int fd)
             remaining -= n;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return kSuccess;
+        } else if (errno == EINTR) {
+            continue; // 被信号打断，重试
         } else {
             return kError;
         }
@@ -85,6 +90,7 @@ std::string Buffer::retrieve(size_t len)
     if (readIndex_ == writeIndex_) {
         readIndex_  = kPrependSize;
         writeIndex_ = kPrependSize;
+        this->shrinkIfLarge(); // 仅完全消费后收缩；否则 resize 会截断未读数据
     }
     return result;
 }
@@ -121,14 +127,8 @@ void Buffer::prepend(const char* data, size_t len)
 
 void Buffer::append(const char* data, size_t len)
 {
-    if (len > (buf_.size() - writeIndex_)) {
-        // 指数扩容：避免频繁 realloc，每次至少翻倍
-        size_t need = writeIndex_ + len;
-        size_t cap  = buf_.size();
-        while (cap < need) cap *= 2;
-        buf_.resize(cap);
-    }
-    char* dest = &buf_[writeIndex_];
+    makeSpace(len);
+    char* dest = buf_.data() + writeIndex_;
     memcpy(dest, data, len);
     writeIndex_ += len;
 }
@@ -140,10 +140,29 @@ const char* Buffer::peek() const
 
 void Buffer::shrinkIfLarge()
 {
-    if (buf_.capacity() > 65536) {
-        buf_.resize(kPrependSize);
+    if (buf_.size() > kPrependSize) {
+        buf_.resize(kPrependSize); // 仅空缓冲区可安全调用（调用方保证）
+    }
+    // 超过高水位才真正归还内存，避免 keep-alive 连接每请求一次 shrink_to_fit 的分配抖动
+    if (buf_.capacity() > 2 * 1024 * 1024) {
         buf_.shrink_to_fit();
+    }
+}
+
+void Buffer::makeSpace(size_t len)
+{
+    if (writeableBytes() + prependableBytes() < len + kPrependSize) {
+        // 可用空间不够：扩容。need 含 writeIndex_，保证不截断未读数据；
+        // 指数增长避免每次 append 都 realloc + 拷贝可读段（O(n^2)）
+        size_t need = writeIndex_ + len + kPrependSize;
+        size_t cap  = buf_.size();
+        while (cap < need) cap *= 2;
+        buf_.resize(cap);
     } else {
-        buf_.resize(kPrependSize);
+        // 空间足够：把可读数据腾到头部，回收 readIndex_ 之前被消费过的空间
+        size_t readable = readableBytes();
+        std::copy(buf_.data() + readIndex_, buf_.data() + writeIndex_, buf_.data() + kPrependSize);
+        readIndex_  = kPrependSize;
+        writeIndex_ = readIndex_ + readable;
     }
 }

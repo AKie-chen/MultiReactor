@@ -78,6 +78,14 @@ void TcpServer::stopAccepting() // 只停监听，不动现有连接（优雅排
     acceptor_.close();
 }
 
+void TcpServer::forEachConnection(const std::function<void(const TcpConnection::ptr&)>& fn)
+{
+    std::lock_guard<std::mutex> lock(connMutex_);
+    for (const auto& conn : connections_) {
+        fn(conn);
+    }
+}
+
 void TcpServer::shutdown()
 {
     acceptor_.close();      // 1. 停止接受新连接

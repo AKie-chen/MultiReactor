@@ -21,6 +21,9 @@ public:
     void shutdown();
     void stopAccepting(); // 只停监听，不动现有连接（优雅排空用）
     void setMaxConnections(size_t max) { maxConnections_ = max; }
+    // 遍历所有活跃连接（供心跳空闲超时扫描）。回调在 connMutex_ 锁内执行，
+    // 只做只读访问/投递，勿在里面直接操作连接状态
+    void forEachConnection(const std::function<void(const TcpConnection::ptr&)>& fn);
 private:
     EventLoop* loop_;
     Acceptor acceptor_;

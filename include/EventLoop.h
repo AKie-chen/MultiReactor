@@ -20,7 +20,7 @@ private:
     std::vector<std::function<void()>> pendingFunctors_;//销毁Channel指针的队列
     TimerQueue timerQueue_; // 定时器队列对象，用于管理定时器事件
     bool callingPendingFunctors_ = false; //判断是否进入销毁队列
-
+    std::atomic<bool> wakeupPending_ = false; //判断是否需要唤醒
     
 public:
     EventLoop();

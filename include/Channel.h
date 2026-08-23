@@ -25,6 +25,7 @@ public:
     void handleEvent(uint32_t events);// 处理事件，根据事件类型调用相应的回调函数
     int fd() const { return fd_; } // 获取文件描述符
     uint32_t events() const { return events_; } // 获取当前关注的事件类型
+    bool isWritingEnabled() const { return (events_ & EPOLLOUT) != 0; } // EPOLLOUT 是否已注册（ET 下永不注销，避免重复 MOD）
 
     void setReadCallback(const std::function<void()>& cb) { readCallback_ = cb; }
     void setWriteCallback(const std::function<void()>& cb) { writeCallback_ = cb; }

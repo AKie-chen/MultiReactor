@@ -7,7 +7,7 @@
 
 基于 **epoll ET** 从零实现的多线程 **Reactor 模式** C++17 HTTP 服务器，无任何第三方依赖。
 核心设计参考 muduo（主从 Reactor、one loop per thread、eventfd 唤醒、timerfd 定时器），
-实测吞吐 **6.7 万 req/s**（1000 并发，VM 环境）。
+实测动态路由峰值吞吐 **6.8 万 req/s**（1000 并发，VM 环境），静态小文件 8 万 req/s。
 
 > 这是一个以学习为目的、以生产工程标准要求自己的项目：所有关键设计决策都经过
 > 真实压测/ASan/UBSan 验证，每个踩过的坑都记录在代码注释与本文档中。
@@ -17,16 +17,17 @@
 | 类别 | 内容 |
 |------|------|
 | I/O 模型 | epoll **ET** 边缘触发 + 非阻塞 I/O，readv + 64KB extrabuf 循环读，动态扩容 |
-| 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 线程 RR 分发）+ 有界队列工作线程池，eventfd 跨线程唤醒 |
+| 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 线程 RR 分发）+ 有界队列工作线程池，eventfd 跨线程唤醒；**请求级并行**：同连接多请求独立提交 worker，seq 有序响应队列按序重排发送 |
 | 生命周期 | `shared_ptr` + `queueInLoop` 延迟析构，消除并发下 use-after-free（ASan 验证） |
-| HTTP/1.1 | GET/POST/HEAD，状态机解析（跨 TCP 拆包累积），keep-alive / pipelining 保序 |
-| 协议安全 | CL+CL 冲突 → 400、Transfer-Encoding → 501 拒绝、头部/body 限长 → 413、请求行非法字符校验 |
+| HTTP/1.1 | GET/POST/HEAD，状态机解析（跨 TCP 拆包累积），keep-alive / pipelining 保序；Host 头校验（RFC 7230 §5.4）、响应 Date 头（RFC 7231 §7.1.1.2）、`Expect: 100-continue`、URL 解码按 RFC 3986（path 中 `+` 保持字面量，仅 query 做表单解码） |
+| 协议安全 | 缺 Host / 重复 Host 冲突 → 400、CL+CL 冲突 → 400、Transfer-Encoding → 501 拒绝、无法满足的 Expect → 417、头部/body 限长 → 413（先于 100-continue） |
 | 路由 | 精确匹配 + 参数化（`/user/:id`）+ 通配符（`*`），URL 解码后匹配 |
-| 静态文件 | sendfile 零拷贝（>64KB）+ LRU 内容缓存（≤64KB）+ realpath 路径穿越防护 + 304 协商缓存 |
+| 静态文件 | sendfile 零拷贝（>64KB）+ LRU 内容缓存（≤64KB）+ realpath 路径穿越防护 + 304 协商缓存；**TOCTOU 加固**：openat2 + RESOLVE_NO_SYMLINKS 关闭校验与 open 之间的竞态窗口，文件 fd 一次打开直传发送层（消除二次 open） |
 | 背压 | 线程池队列满 → 503 **不关连接**（避免"拒绝→重连→更忙"风暴） |
 | 定时器 | timerfd + 自实现最小堆（O(log n) cancel），空闲连接超时 |
 | 优雅关闭 | 信号 → eventfd → 停止 accept → 排空在途请求 → 连接归零退出，10s 兜底 |
 | 可观测性 | 6 个 lock-free atomic 指标 + `/stats` JSON，结构化日志，CLI/配置文件双源配置 |
+| syscall 削减 | eventfd 唤醒去重（`wakeupPending_` 原子）、send 先直接写 EAGAIN 才注册 EPOLLOUT（消除 epoll_ctl 乒乓）、timerfd 惰性重置（1s 心跳扫描替代每请求 cancel/addTimer）。strace 实测 1000 keep-alive 请求：epoll_ctl 11 次、timerfd_settime 5 次（旧实现各 2000/1000 次），每请求 ≈4 次 syscall |
 
 ## 架构
 
@@ -61,16 +62,18 @@ epoll_wait → Channel → TcpConnection::handleRead (ET 循环读)
 | `shared_ptr` 而非裸指针 | worker/定时器/IO 多线程并发持有连接引用，裸指针必然 UAF；最后一个引用释放才析构 |
 | 延迟析构 | 事件回调执行时 Channel 指针还在 epoll 的 events 数组里，`delete this` 会悬垂 |
 | realpath 而非字符串禁 `..` | 黑名单可被 `//`、`%2e%2e`、符号链接绕过；realpath 解析规范路径后前缀比较 |
-| 大文件 sendfile / 小文件 LRU | >64KB 走零拷贝（内核态 DMA），≤64KB 走内存缓存（省 open/read syscall，实测 6.7 万 req/s） |
+| 请求级并行 + seq 有序响应队列 | 流水线请求独立提交 worker（乱序完成），`deliverResponse` 按 seq 直发/暂存/顺藤排空，保序（RFC 7230 §6.3.2）的同时打掉单连接串行化天花板；`markForClose` 先于投递评估，direct 写路径也能及时关闭短连接 |
+| openat2 而非仅 realpath 校验 | realpath 只消除"已有"符号链接，校验与 open 之间的替换窗口是 TOCTOU；openat2 + RESOLVE_NO_SYMLINKS 在 open 时刻原子校验全路径分量，老内核回退 O_NOFOLLOW + fstat dev/ino 比对（残余窗口仅中间分量，见代码注释） |
+| 大文件 sendfile / 小文件 LRU | >64KB 走零拷贝（内核态 DMA），≤64KB 走内存缓存（省 open/read syscall，实测静态小文件 8 万 req/s） |
 | 503 背压不关连接 | 关连接版会触发客户端"拒绝→重连→更忙"风暴 + 服务端 TIME_WAIT 堆积（实测 3000+） |
-| 每连接串行化 | 保证流水线响应严格保序（RFC 7230 §6.3.2）；代价是单连接无并发，见 Roadmap ③ |
 | `addTimer`/`cancel` 断言 IO 线程 | 定时器全生命周期单线程，零锁竞争 |
 
 ## 踩坑记录（调试故事）
 
 | 现象 | 根因 | 修复（验证手段） |
 |------|------|------------------|
-| 流水线请求响应错配 `[200,400] → [400,400]` | 多 worker 乱序完成 + queueInLoop 入队竞态 | 每连接请求串行化（压测复现） |
+| 流水线请求响应错配 `[200,400] → [400,400]` | 多 worker 乱序完成 + queueInLoop 入队竞态 | 分配 seq + `deliverResponse` 暂存/补发按序重排（压测复现） |
+| 短连接响应后不关闭（挂到心跳超时） | 直接写成功路径无 EPOLLOUT 事件，`maybeCloseAfterSend` 唯一评估点被跳过；`markForClose` 又在投递之后才设置标志 | `markForClose` 先于 `deliverResponse`，末尾评估可见（EOF 时序回归脚本复现：修复前每连接 3s 超时） |
 | 优雅关闭后连接永不退出 | 排空期静默丢弃请求，客户端挂起 | 排空期请求照常处理 + 强制 `Connection: close`（挂 3s 实测） |
 | fd 耗尽时 epoll 忙循环 | accept 返回 EMFILE 但 listen fd 仍可读 | 预留 idle fd，EMFILE 时 accept 一个立即关闭排空 backlog（muduo 技巧） |
 | 连接一建立就超时断开 | `resetTimer` 过期时间忘了加 `now`，立即到期 | 修复后 keep-alive 正常（功能回归） |
@@ -106,54 +109,47 @@ wrk -t4 -c100 -d10s --latency http://127.0.0.1:8080/
 ## 性能
 
 测试环境：VMware 虚拟机 4 vCPU @ 3.2GHz（宿主机 Ryzen 7 7735H），4 IO + 4 worker，
-Release，本机回环，wrk 5 轮 × 10s 取平均。
+Release，本机回环，wrk 5 轮 × 10s 取平均（2026-08 syscall 削减后重新压测；
+c≥1000 多次运行波动 ±10%，表中为 2~3 轮平均）。
 
 | 并发连接 | 平均吞吐 (req/s) | P50 | P99 |
 |----------|------------------|-----|-----|
-| 100 | 48,490 | 1.91 ms | 5.28 ms |
-| 500 | 62,108 | 7.43 ms | 17.07 ms |
-| 1000 | **67,003** | 14.04 ms | 31.39 ms |
-| 2000 | 62,040 | 29.48 ms | 69.63 ms |
+| 100 | 52,912 | 1.71 ms | 5.45 ms |
+| 500 | 62,997 | 7.29 ms | 19.41 ms |
+| 1000 | **65,513** | 14.11 ms | 34.81 ms |
+| 2000 | 60,326 | 30.53 ms | 77.97 ms |
 
 | 场景 | 吞吐 (req/s) | P50 | P99 |
 |------|--------------|-----|-----|
-| 动态路由 /user/123（-c1000） | 67,003 | 14.04 ms | 31.39 ms |
-| 静态小文件（LRU 命中） | 67,429 | 1.30 ms | 4.51 ms |
-| 大文件 300KB（sendfile） | 15,820 | 5.46 ms | 14.30 ms |
+| 动态路由 /user/123（-c1000） | 65,513 | 14.11 ms | 34.81 ms |
+| 静态小文件（LRU 命中，-c100） | 80,358 | 1.06 ms | 3.67 ms |
+| 大文件 300KB（sendfile，-c100） | 16,719 | 5.10 ms | 14.69 ms |
 
 **诚实的瓶颈分析**（完整数据与推导见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)）：
 
-- 每请求 **65,000 cycles**（20.4 µs），其中内核态 78%——每请求 7 次系统调用
-  （readv / send / epoll_ctl×2 / timerfd_settime / eventfd×2），VM 内约 2.3 µs/次
-- 4 vCPU 理论峰值 ≈ 19.7 万 req/s，实测达成率 34%：**延迟受限而非 CPU 受限**
-  （1000 连接 × ~14ms ≈ 6.7 万，与 Little's law 一致）
-- 吞吐随并发先升后降：串行化限制单连接并发，高吞吐靠多连接摊平（见 Roadmap ③）
+- syscall 削减效果直接可见（削减前每请求 7 次系统调用：readv / send / epoll_ctl×2 /
+  timerfd_settime / eventfd×2，内核态占 78%、约 20.4 µs；削减后 ≈4 次）：c=100 动态
+  路由 48.5k→52.9k（+9%）、静态小文件 67.4k→80.4k（+19%，P50 1.30→1.06 ms）；
+  削减前旧峰值 67,003 落在新测量区间（c1000: 61.7k–68.2k）内，高并发持平无回归
+- 4 vCPU 理论峰值 ≈ 19.7 万 req/s，实测达成率 33%：**延迟受限而非 CPU 受限**
+  （1000 连接 × ~14 ms ≈ 6.5 万，与 Little's law 一致）
+- c≥1000 三次复测波动 ±10%（VM 调度噪声）；请求级并行的单连接流水线收益需专用
+  流水线压测工具量化（wrk 单连接不并发，现有多连接数据反映的是聚合吞吐）
 
 ## 测试与验证
 
-- **协议/功能**：25 项协议测试 + 22 项功能回归全部通过
-- **内存安全**：ASan/UBSan 下 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零错误
+- **单元测试**：60 个用例（`./build/unit_tests` 或 `ctest`）覆盖 HttpContext 解析状态机（拆包逐字节、畸形请求行、CL 冲突、TE 拒绝、Host 校验、Expect、限长）、Router、StaticFileHandler（穿越/符号链接/缓存失效/304），零第三方依赖
+- **协议/功能**：27 项端到端回归（动态路由 + 协议行为 + 静态文件逐字节 + 短连接关闭时序 + 并发 50×20 + SIGTERM 优雅关闭）全部通过
+- **内存安全**：ASan/UBSan 下 60 单测 + 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零错误
 - **背压**：`--max-queue-size 1` + 200 并发实测触发 503，连接保持无重连风暴
 - **优雅关闭**：SIGTERM 压测中在途大文件响应完整送达（逐字节校验）、活跃连接归零后 0.1s 内退出
 - **CI**：GitHub Actions，gcc/clang × Release/Debug 四组矩阵构建 + 冒烟测试
 
-## 当前边界与 Roadmap
+## 当前边界
 
 - HTTP 仅 GET/POST/HEAD；无 chunked（TE → 501 显式拒绝）
 - 无 TLS / HTTP/2 / WebSocket；路由不支持正则
 - 指标无延迟分位数 histogram；日志直接写终端无异步落盘
-
-**下一步计划（按优先级）**：
-
-1. **单元测试接入**：HttpContext 解析状态机 / Router 是纯逻辑模块，接入轻量测试框架，
-   覆盖拆包、畸形行、CL 冲突、TE 拒绝等边界（当前依赖冒烟测试，强度不足）
-2. **HTTP/1.1 协议补齐**：Host 头校验（RFC 7230 §5.4）、响应 Date 头（RFC 7231 §7.1.1.2）、
-   `Expect: 100-continue`、URL 解码按 RFC 3986 修正（path 中的 `+` 应保持字面量）
-3. **打破串行化天花板**：请求级并行 + per-connection 有序响应队列替代 processing_ 串行化，
-   单连接流水线吞吐有望成倍提升（当前架构最大瓶颈）
-4. **syscall 削减**：合并 eventfd 两次投递、消除 epoll_ctl enable/disable 乒乓、
-   timerfd 惰性重置——目标每请求 7 次 → 3 次，裸机部署可达数十万 req/s
-5. **安全加固**：静态文件路径检查与 open 之间的 TOCTOU 窗口（openat2 或 O_NOFOLLOW + fstat）
 
 ## 项目结构
 
@@ -161,6 +157,7 @@ Release，本机回环，wrk 5 轮 × 10s 取平均。
 include/    # 18 个头文件：EventLoop / Channel / Acceptor / TcpConnection /
             # HttpContext / Buffer / TimerQueue / ThreadPool / Router / ...
 src/        # 对应实现
+test/       # 60 个单元测试（零依赖 TEST_CASE 框架，ctest 接入）
 docs/
 ├── ARCHITECTURE.md   # 架构详解 + 13 步迭代记录（每个优化对应功能增量）
 └── DESIGN.md         # 逐模块设计决策 + 方案对比 + 底层原理（1119 行）

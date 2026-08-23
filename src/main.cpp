@@ -123,36 +123,16 @@ int main(int argc, char* argv[]) {
 
 
 
-    auto resetTimer = [&cfg](TcpConnection::ptr conn) {
-        if (conn->timerId() != 0) {
-            conn->getLoop()->timerQueue().cancel(conn->timerId());
-            conn->setTimerId(0);
-        }
-
-        // 设置新定时器：expiration 是绝对时间 (CLOCK_MONOTONIC 微秒)
-        timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        int64_t now = ts.tv_sec * 1'000'000 + ts.tv_nsec / 1'000;
-        int64_t expiration = now + cfg.connectionTimeoutSec * 1'000'000;
-
-        int64_t timerId = conn->getLoop()->timerQueue().addTimer([conn]() {
-            conn->forceClose();
-        }, expiration);
-
-        conn->setTimerId(timerId);
-    };
-
-    server.setConnectionCallback([&resetTimer](TcpConnection::ptr conn) {
-        resetTimer(conn);
-        conn->setCloseCallback([](TcpConnection::ptr c) {
-            if (c->timerId() != 0) {
-                c->getLoop()->timerQueue().cancel(c->timerId());
-                c->setTimerId(0);
-            }
-        });
+    // timerfd 惰性重置：空闲超时不再每请求 cancel+addTimer（每请求一次
+    // timerfd_settime——单连接压测下新 timer 总是堆顶，earliestChanged 恒为真）。
+    // 改为：连接只记 lastActiveTime_（零 syscall），下面注册的 1s 心跳定时器扫描
+    // 所有连接，超时才强关。timerfd_settime 从每请求 1 次 → 启动时 1 次；
+    // 代价是超时精度从精确毫秒降为 ±1s（keep-alive 场景可接受）
+    server.setConnectionCallback([](TcpConnection::ptr conn) {
+        conn->markActive();  // 空闲超时从连接建立起算
     });
 
-    server.setMessageCallback([&resetTimer, &threadPool, &router, &staticHandler, &isShutdown]
+    server.setMessageCallback([&threadPool, &router, &staticHandler, &isShutdown]
                               (TcpConnection::ptr conn, Buffer* buf) {
         // 排空期（SIGTERM 后）：请求照常处理，但响应后连接即关闭。
         // 不能静默丢弃——客户端已发出的请求必须得到响应，否则挂起直到超时
@@ -164,44 +144,86 @@ int main(int argc, char* argv[]) {
 
         // 解析请求（解析状态累积在 ctx 内部，TCP 拆包时多次 EPOLLIN 之间不丢失）
         if (!ctx.parseRequest(buf)) {
-            if (ctx.error() == HttpContext::kNoError) return; // 请求不完整，继续等待
+            if (ctx.error() == HttpContext::kNoError) {
+                // RFC 7231 §5.1.1：请求带 Expect: 100-continue 且头部已解析完（等待 body）→
+                // 立即回 100 Continue，客户端才会发送 body。每个请求只回一次（continueSent_）。
+                // 注意顺序：413 等拒绝已在 parseRequest 里先于状态转移检查，不会发完 100 再反悔
+                if (ctx.shouldSendContinue()) {
+                    conn->send("HTTP/1.1 100 Continue\r\n\r\n");
+                    ctx.markContinueSent();
+                }
+                return; // 请求不完整，继续等待
+            }
             else if (ctx.error() == HttpContext::kBadRequest) { // 400 Bad Request
                 Metrics::instance().errors4xx++;
-                conn->send(HttpResponse::makeError(
-                    HttpResponse::k400BadRequest, "Bad Request").toString());
+                // 错误响应也按当前请求的 seq 定序：前面在途响应未发完时先暂存
+                HttpResponse errResp = HttpResponse::makeError(
+                    HttpResponse::k400BadRequest, "Bad Request");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
                 conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
                 ctx.reset();
                 return;
             } else if (ctx.error() == HttpContext::kMethodNotSupported) { // 405 Method Not Allowed
                 Metrics::instance().errors4xx++;
-                conn->send(HttpResponse::makeError(
+                HttpResponse errResp = HttpResponse::makeError(
                     HttpResponse::k405MethodNotAllowed,
-                    "Method Not Supported").toString());
+                    "Method Not Supported");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
                 conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
                 ctx.reset();
                 return;
             } else if (ctx.error() == HttpContext::kVersionNotSupported) { // 505 HTTP Version Not Supported
                 Metrics::instance().errors5xx++;
-                conn->send(HttpResponse::makeError(
+                HttpResponse errResp = HttpResponse::makeError(
                     HttpResponse::k505HttpVersionNotSupported,
-                    "Http Version Not Supported").toString());
+                    "Http Version Not Supported");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
                 conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
                 ctx.reset();
                 return;
             } else if (ctx.error() == HttpContext::kHeaderTooLarge) { // 413 Header Too Large
                 Metrics::instance().errors4xx++;
-                conn->send(HttpResponse::makeError(
+                HttpResponse errResp = HttpResponse::makeError(
                     HttpResponse::k413PayloadTooLarge,
-                    "Request Header Too Large").toString());
+                    "Request Header Too Large");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
                 conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
                 ctx.reset();
                 return;
             } else if (ctx.error() == HttpContext::kNotImplemented) { // 501 Not Implemented (Transfer-Encoding)
                 Metrics::instance().errors5xx++;
-                conn->send(HttpResponse::makeError(
+                HttpResponse errResp = HttpResponse::makeError(
                     HttpResponse::k501NotImplemented,
-                    "Not Implemented").toString());
+                    "Not Implemented");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
                 conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
+                ctx.reset();
+                return;
+            } else if (ctx.error() == HttpContext::kExpectationFailed) { // 417 Expectation Failed
+                Metrics::instance().errors4xx++;
+                HttpResponse errResp = HttpResponse::makeError(
+                    HttpResponse::k417ExpectationFailed,
+                    "Expectation Failed");
+                // 先标记再投递：direct 写成功路径没有 EPOLLOUT 事件触发 handleWrite，
+                // deliverResponse 末尾的 maybeCloseAfterSend 是唯一评估点（实测：顺序
+                // 放反会一直挂到心跳空闲超时才关连接）
+                conn->markForClose();
+                conn->deliverResponse(conn->nextRequestSeq(), errResp, true);
                 ctx.reset();
                 return;
             }
@@ -211,15 +233,12 @@ int main(int argc, char* argv[]) {
         HttpRequest req = ctx.request();
         ctx.reset();
         Metrics::instance().totalRequests++;
-        resetTimer(conn);
+        conn->markActive();  // 刷新空闲超时计时（心跳扫描用，零 syscall）
 
-        // 请求串行化（见 TcpConnection::processing_ 注释）：
-        // 提交前上锁，响应入队时在 queueInLoop lambda 里 endRequest() 解锁。
-        // 保证同一连接上响应与请求严格一一对应、顺序一致——
-        // 否则多线程池乱序完成会让流水线响应错配（实测 [200,400] → [400,400]），
-        // 且错误路径同步关连接会丢掉前序在途响应
-        conn->beginRequest();
-        bool submitted = threadPool.tryRun([conn, req, &router, &staticHandler, &isShutdown]() {
+        // 请求级并行：分配序号后独立提交 worker（同一连接多个请求同时在池中）。
+        // 响应乱序完成、由 deliverResponse 按序发送，替代原 processing_ 串行化
+        uint64_t seq = conn->nextRequestSeq();
+        bool submitted = threadPool.tryRun([conn, req, seq, &router, &staticHandler, &isShutdown]() {
             HttpResponse resp;
 
             // 处理路由
@@ -257,14 +276,13 @@ int main(int argc, char* argv[]) {
 
             // HEAD 只发头部（RFC 7231 §4.3.2）：Content-Length 保留真实大小，body/文件本体不发
             bool isHead = (req.method() == HttpRequest::kHead);
-            conn->getLoop()->queueInLoop([conn, resp, closeConn, isHead]() {
-                if(resp.isFileBody()){
-                    conn->sendResponse(resp, !isHead);
-                } else {
-                    conn->send(resp.toString(!isHead));
-                }
+            conn->getLoop()->queueInLoop([conn, seq, resp, closeConn, isHead]() {
+                // 先标记再投递：markForClose 若在 deliverResponse 之后，末尾的
+                // maybeCloseAfterSend 看不到标志；direct 写成功又无 EPOLLOUT 事件
+                // 补评，短连接会一直挂到心跳空闲超时才关闭（fd 长时间占用）
                 if (closeConn) conn->markForClose();
-                conn->endRequest();  // 解锁串行化，继续处理剩余流水线请求
+                // 按序投递：乱序完成的响应由 deliverResponse 暂存/重排，保证响应与请求保序
+                conn->deliverResponse(seq, resp, !isHead);
             });
         });
 
@@ -282,13 +300,32 @@ int main(int argc, char* argv[]) {
             Metrics::instance().errors5xx++;
             bool keepAlive = (req.version() == "HTTP/1.1" && !isShutdown);
             if (keepAlive) resp.setCloseConnection(false); // makeError 默认关连接，覆盖掉
-            conn->getLoop()->queueInLoop([conn, resp, keepAlive]() {
-                conn->send(resp.toString());
-                if (!keepAlive) conn->markForClose(); // HTTP/1.0 无显式 keep-alive，保持原行为
-                conn->endRequest();
-            });
+            // 503 也是"本请求 seq"的响应，必须走定序——前面可能还有在途响应未发。
+            // messageCallback 运行在 IO 线程，可直接同步投递
+            if (!keepAlive) conn->markForClose(); // 先标记再投递（同上：direct 写路径唯一评估点是 deliverResponse 末尾）
+            conn->deliverResponse(seq, resp, true); // HTTP/1.0 无显式 keep-alive，保持原行为
         }
     });
+
+    // 空闲超时心跳：1s 重复定时器（addTimer 只调一次 timerfd_settime），扫描所有
+    // 连接，超过 connectionTimeoutSec 无活动则投递到所属 IO 线程强关。
+    // 连接状态（Channel/发送队列）只能在其所属 IO 线程操作，跨线程触达会与
+    // IO 线程并发（shutdown() 的 queueInLoop 投递同理）
+    {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t now = ts.tv_sec * 1'000'000 + ts.tv_nsec / 1'000;
+        loop.timerQueue().addTimer([&server, &cfg]() {
+            timespec t2;
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            int64_t now = t2.tv_sec * 1'000'000 + t2.tv_nsec / 1'000;
+            server.forEachConnection([&](const TcpConnection::ptr& conn) {
+                if (now - conn->lastActiveTime() >= cfg.connectionTimeoutSec * 1'000'000) {
+                    conn->getLoop()->queueInLoop([conn]() { conn->forceClose(); });
+                }
+            });
+        }, now + 1'000'000, 1.0);  // 重复定时器，间隔 1s
+    }
 
     server.setMaxConnections(cfg.maxConnections);
     server.start(cfg.listenBacklog);

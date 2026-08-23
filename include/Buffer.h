@@ -9,6 +9,7 @@ private:
     std::vector<char> buf_;
     size_t readIndex_;
     size_t writeIndex_;
+    void makeSpace(size_t len);
 
 public:
     enum ReadResult { kSuccess, kError, kClosed };

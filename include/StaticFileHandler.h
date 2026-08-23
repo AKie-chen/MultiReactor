@@ -30,7 +30,6 @@ private:
     bool isWithinRoot(const char* resolved) const;
 
     static std::string getMimeType(const std::string& path);   // 后缀 → Content-Type
-    std::string readFile(const std::string& filepath);  // 读文件内容
 
     std::string rootDir_;        // 如 "./static"
     char rootDirAbs_[PATH_MAX];  // 如 "/home/user/project/static"

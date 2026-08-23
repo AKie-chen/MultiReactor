@@ -45,16 +45,29 @@ void EventLoop::loop() {
             if(errno==EINTR){ continue; }// 被信号中断，继续等待事件
         }
         
-        std::vector<std::function<void()>> temp; // 供销毁的vector
-        {
-            std::lock_guard<std::mutex> lock(mutex_); // 加锁，保护共享数据pendingFunctors_
-            temp.swap(pendingFunctors_);//交换任务，temp拿到需要销毁的任务，而pendingFunction_则清空等待新的销毁任务
+        // 合并 eventfd 两次投递的接收侧：worker 投递用 wakeupPending_ 原子去重
+        // （只有第一个投递者真正写 eventfd），这里把 pending 处理到彻底为空才解除武装
+        // （wakeupPending_ = false）。必须 do-while 而不是单遍处理：
+        // 单遍会在"处理期间新入队的任务"上丢唤醒——投递者看到 wakeupPending_ 仍置位
+        // 会跳过 write，任务挂到下次 epoll 事件或 5s 超时才被处理。
+        // 解除武装须在锁内且 pending 为空的时刻进行：此后入队的投递者 exchange
+        // 拿到 false 才会自己写 eventfd，不会丢失
+        for (;;) {
+            std::vector<std::function<void()>> temp;
+            {
+                std::lock_guard<std::mutex> lock(mutex_); // 加锁，保护共享数据pendingFunctors_
+                if (pendingFunctors_.empty()) {
+                    wakeupPending_ = false; // 解除武装
+                    break;
+                }
+                temp.swap(pendingFunctors_); // 交换任务，temp 拿到要执行的任务，pendingFunctors_ 清空等待新任务
+            }
+            callingPendingFunctors_ = true;
+            for (auto& func : temp) {
+                func();
+            }
+            callingPendingFunctors_ = false;
         }
-        callingPendingFunctors_ = true;
-        for (auto &func : temp) {
-            func();
-        }
-        callingPendingFunctors_ = false;
     }
 }
 
@@ -80,23 +93,23 @@ void EventLoop::queueInLoop(std::function<void()> cb)//将销毁动作放进销�
         std::lock_guard<std::mutex> lock(mutex_); // 加锁，保护共享数据pendingFunctors_
         pendingFunctors_.push_back(std::move(cb)); // 将回调函数cb添加到销毁队列中
     }
-    if(std::this_thread::get_id() != threadId_ || callingPendingFunctors_){
+    if((std::this_thread::get_id() != threadId_ || callingPendingFunctors_) && !wakeupPending_.exchange(true)){
         wakeup(); // 如果当前线程不是事件循环所在的线程，或者正在调用销毁队列中的回调函数，则唤醒事件循环
     }
 }
 
 void EventLoop::handleWakeup() {
+    // 循环读到 EAGAIN：一次 EPOLLIN 可能对应多次 write（计数累加）。
+    // 必须全部清空——残留计数会压制后续 EPOLLIN（ET 只在计数 0→1 的状态变化时
+    // 触发），后续投递的唤醒会被吞掉（原实现只读一次，多 worker 并发投递丢唤醒）
     uint64_t one;
-    ssize_t n = read(wakeupFd_, &one, sizeof(one));
-    if (n != sizeof(one)) {
-        LOG_ERROR << "handleWakeup() reads " << n << " bytes instead of 8";
-    }
+    while (read(wakeupFd_, &one, sizeof(one)) == sizeof(one)) {}
 }
 
 void EventLoop::wakeup() // 唤醒事件循环
 {
     uint64_t val = 1;
-    write(wakeupFd_, &val, sizeof(val));
+    write(wakeupFd_, &val, sizeof(val)); // 向wakeupFd_写入一个8字节的值，用于唤醒事件循环
 }
 
 TimerQueue& EventLoop::timerQueue() //获取定时器队列对象

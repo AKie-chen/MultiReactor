@@ -1,4 +1,16 @@
 #include "HttpResponse.h"
+#include <ctime>
+
+// 获取time_t对应的HTTP日期格式字符串
+std::string httpDate(time_t t) {
+    char buf[128];
+    struct tm tm;
+    if(gmtime_r(&t, &tm) == nullptr) {
+        return "";
+    }
+    strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    return std::string(buf);
+}
 
 HttpResponse::HttpResponse() : statusCode_(HttpStatusCode::k200Ok)
                              , statusMessage_("OK")
@@ -66,6 +78,10 @@ void HttpResponse::appendToBuffer(Buffer* buf) const// 序列化成 HTTP 响应�
     std::string statusLine = "HTTP/1.1 " + std::to_string(statusCode_) + " " +statusMessage_ + "\r\n";
     buf->append(statusLine.data(), statusLine.size());
 
+    // Date：RFC 7231 §7.1.1.2 所有响应必须带（与 headersToString 保持一致）
+    std::string dateLine = "Date: " + httpDate(time(nullptr)) + "\r\n";
+    buf->append(dateLine.data(), dateLine.size());
+
     //序列化头
     for(auto& [key, value] : headers_){
         std::string h = key + ": " + value + "\r\n";
@@ -102,6 +118,9 @@ std::string HttpResponse::headersToString() const // 将响应头部转换为字
 
     // 状态行
     result += "HTTP/1.1 " + std::to_string(statusCode_) + " " + statusMessage_ + "\r\n";
+    // Date：RFC 7231 §7.1.1.2 服务器 MUST 生成。加在唯一序列化汇合点（toString/sendResponse 都走这里），
+    // 保证 200/304/404/413/501/503 所有响应都有，无需各 handler 逐个添加
+    result += "Date: " + httpDate(time(nullptr)) + "\r\n";
     // 头部
     for (auto& [k, v] : headers_) {
         result += k + ": " + v + "\r\n";
@@ -131,9 +150,14 @@ HttpResponse HttpResponse::makeError(HttpResponse::HttpStatusCode code, const st
     return response;
 }
 
-void HttpResponse::setFileBody(const std::string& filepath, off_t size) // 设置文件作为响应体
+void HttpResponse::setFileFd(const FileFd& fd, off_t size) // 设置文件作为响应体
 {
     isFileBody_ = true;
-    fileBodyPath_ = filepath;
+    fileFd_ = fd;
     fileBodySize_ = size;
+}
+
+FileFd makeFileFd(int fd)
+{
+    return FileFd(new FileHandle(fd));
 }
