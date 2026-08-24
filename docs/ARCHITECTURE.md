@@ -12,7 +12,7 @@ main
 ├── Metrics (6 个 atomic 计数器, lock-free)
 ├── Router (精确路由: method + path → handler)
 ├── StaticFileHandler (磁盘文件服务 + 路径穿越防护)
-├── ThreadPool (4 线程, CPU 密集任务)
+├── ThreadPool (2 线程, 默认配置, 请求处理)
 ├── EventLoop (主线程, accept + 信号 + 定时器)
 │   ├── TimerQueue (timerfd + 自实现最小堆, 连接超时管理)
 │   ├── TcpServer
@@ -76,11 +76,11 @@ cmake --build build -j$(nproc)
 ### 运行
 
 ```bash
-# 默认配置 (端口 8080, 4 IO 线程, 4 工作线程, 超时 10s)
+# 默认配置 (端口 8080, 4 IO 线程, 2 工作线程, 超时 10s)
 ./build/multireactor
 
 # 命令行参数
-./build/multireactor -p 9090 -i 2 -w 8 -d ./public -t 30 --log-level DEBUG
+./build/multireactor -p 9090 -i 4 -w 2 -d ./public -t 30 --log-level DEBUG
 
 # 配置文件 + CLI 覆盖 (CLI 优先级高于文件)
 ./build/multireactor -c server.conf -p 9090
@@ -95,7 +95,7 @@ cmake --build build -j$(nproc)
 # server.conf
 port = 8080
 io_threads = 4
-worker_threads = 4
+worker_threads = 2
 static_dir = ./static
 timeout = 10
 log-level = INFO
@@ -121,7 +121,11 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 
 ## 性能
 
-测试环境: 4 IO + 4 worker 线程, Release 编译, 本机回环, wrk 4 线程 10s, 动态路由 `/user/123`。
+测试环境: 4 IO + 2 worker 线程, Release 编译, 本机回环, wrk 4 线程 10s, 动态路由 `/user/123`。
+
+> 注：本节数据为 2026-08 默认配置调整（4 IO + 4 worker → 4 IO + 2 worker）前的历史测量。
+> 当前默认配置下动态路由峰值 ≈10.1 万 req/s（-c1000，wrk --latency），线程组合扫描与
+> 瓶颈分析见 [README 性能节](../README.md)。
 
 ### 吞吐量 vs 并发度
 

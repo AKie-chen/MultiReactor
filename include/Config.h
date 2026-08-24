@@ -14,8 +14,10 @@ struct ServerConfig{
     int maxQueueSize = 1024; // 线程池队列最大长度
 
     // 线程
+    // 实测最优组合：IO 线程 ≈ 核数，worker 线程 2~3（轻任务下 worker 过多会
+    // 放大线程池锁竞争与 notify_one 空唤醒，见 README 性能节 2026-08 压测数据）
     size_t ioThreads = 4;
-    size_t workerThreads = 4;
+    size_t workerThreads = 2;
 
     // 静态文件
     std::string staticDir = "./static";
