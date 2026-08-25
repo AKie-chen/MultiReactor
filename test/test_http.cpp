@@ -1,8 +1,10 @@
 #include "test_framework.h"
 #include "HttpContext.h"
+#include "HttpResponse.h"
 #include "Buffer.h"
 #include <algorithm>
 #include <string>
+#include <ctime>
 
 // ---------- 辅助 ----------
 
@@ -328,4 +330,22 @@ TEST_CASE(ResetReuseBetweenRequests) {
     CHECK_EQ(ctx.request().path(), "/second");
     CHECK_EQ(ctx.request().getHeader("Host"), "b");
     CHECK_EQ(ctx.request().body(), "hi");
+}
+
+// ---------- Date 头（每秒缓存） ----------
+
+// httpDateNow：返回 RFC 1123 IMF-fixdate 格式（"Mon, 02 Jan 2006 15:04:05 GMT"），
+// 缓存不破坏正确性——值等于当前秒的 httpDate 格式化结果（允许秒边界 +1 的滚动）
+TEST_CASE(DateHeader_CachedFormat) {
+    time_t t = time(nullptr);
+    const std::string& d = httpDateNow();
+    CHECK_EQ(d.size(), std::string("Mon, 02 Jan 2006 15:04:05 GMT").size());
+    CHECK_EQ(d.substr(d.size() - 3), std::string("GMT"));  // 结尾 GMT
+    CHECK_EQ(d.substr(d.size() - 4), std::string(" GMT")); // GMT 前有空格（%H:%M:%S GMT）
+    CHECK_EQ(d.substr(3, 1), std::string(","));            // "Fri," 星期缩写后的逗号
+    CHECK(d[d.size() - 7] == ':');                         // 秒字段 ":SS GMT" 前的冒号
+    // 与同秒内（或刚滚动到的下一秒）的 httpDate 逐字符一致
+    CHECK(d == httpDate(t) || d == httpDate(t + 1));
+    // 同一秒内两次调用复用同一缓存对象（地址稳定）
+    CHECK_EQ(&d, &httpDateNow());
 }

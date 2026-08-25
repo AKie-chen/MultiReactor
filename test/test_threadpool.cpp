@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <map>
+#include <stdexcept>
 
 // 等 inFlight 归零 = 所有已受理任务执行完毕。
 // 同时顺带证明 worker 已进入 loop()——规避"quit 早于 loop() 进入 → join 挂起"
@@ -50,6 +51,20 @@ TEST_CASE(ThreadPool_RRDistributes) {
     pool.stop(); // 先 stop 后读，无并发
     CHECK_EQ(counts.size(), 4);             // 4 个不同 worker 线程
     for (auto& [id, n] : counts) CHECK_EQ(n, 10); // RR 恰好每 loop 10 个
+}
+
+TEST_CASE(ThreadPool_ThrowingTaskIsolated) {
+    // 异常隔离：任务抛异常（如 handler 的 params.at() 缺键）不得杀死 worker
+    // 线程（未隔离时 std::terminate → 整个进程崩溃），且 inFlight 必须归零
+    // （漏减 → 后续 tryRun 误判背压 503、优雅关闭 drainCheck 永不收敛挂 10s）
+    ThreadPool pool(1, 0);
+    std::atomic<int> done{0};
+    CHECK(pool.tryRun([]() { throw std::runtime_error("boom"); }));
+    CHECK(pool.tryRun([&done] { done++; }));
+    waitIdle(pool);
+    CHECK_EQ(done.load(), 1);          // 异常任务之后的任务照常执行（worker 存活）
+    pool.stop();
+    CHECK_EQ(pool.inFlight(), 0);      // 异常任务的在途计数也被回收
 }
 
 TEST_CASE(ThreadPool_StopKeepsQueueAlive) {

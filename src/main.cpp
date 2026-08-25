@@ -241,15 +241,29 @@ int main(int argc, char* argv[]) {
         bool submitted = threadPool.tryRun([conn, req, seq, &router, &staticHandler, &isShutdown]() {
             HttpResponse resp;
 
-            // 处理路由
-            std::map<std::string, std::string> params;
-            auto result = router.route(req, &resp, &params);
-            if (result == RouterResult::kNotFound) {
-                if (!staticHandler.handle(req, &resp)) {
-                resp = HttpResponse::makeError(HttpResponse::k404NotFound, "Not Found");
+            // 异常隔离（业务层）：路由 handler / 静态文件处理抛异常（如用户
+            // handler 的 params.at() 缺键、std::bad_alloc 等）→ 统一转 500。
+            // 客户端得到显式错误而非挂起等待超时；再往外是 ThreadPool 包裹层的
+            // 兜底（保证 worker 线程存活 + 在途计数平衡）
+            try {
+                // 处理路由
+                std::map<std::string, std::string> params;
+                auto result = router.route(req, &resp, &params);
+                if (result == RouterResult::kNotFound) {
+                    if (!staticHandler.handle(req, &resp)) {
+                    resp = HttpResponse::makeError(HttpResponse::k404NotFound, "Not Found");
+                    }
+                } else if (result == RouterResult::kMethodNotAllowed) {
+                    resp = HttpResponse::makeError(HttpResponse::k405MethodNotAllowed, "Method Not Allowed");
                 }
-            } else if (result == RouterResult::kMethodNotAllowed) {
-                resp = HttpResponse::makeError(HttpResponse::k405MethodNotAllowed, "Method Not Allowed");
+            } catch (const std::exception& e) {
+                LOG_ERROR << "Handler exception for " << req.path() << ", responding 500: " << e.what();
+                resp = HttpResponse::makeError(HttpResponse::k500InternalServerError, "Internal Server Error");
+                Metrics::instance().errors5xx++;
+            } catch (...) {
+                LOG_ERROR << "Unknown handler exception for " << req.path() << ", responding 500";
+                resp = HttpResponse::makeError(HttpResponse::k500InternalServerError, "Internal Server Error");
+                Metrics::instance().errors5xx++;
             }
 
             int code = static_cast<int>(resp.code());

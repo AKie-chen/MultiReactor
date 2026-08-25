@@ -17,15 +17,16 @@
 | I/O 模型 | epoll **ET** 边缘触发 + 非阻塞 I/O，readv + 64KB extrabuf 循环读，动态扩容 |
 | 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 线程 RR 分发）+ one-loop-per-thread 工作线程池（每 worker 独立 EventLoop，无共享队列，在途计数有界），eventfd 跨线程唤醒；**请求级并行**：同连接多请求独立提交 worker，seq 有序响应队列按序重排发送 |
 | 生命周期 | `shared_ptr` + `queueInLoop` 延迟析构，消除并发下 use-after-free（ASan 验证） |
-| HTTP/1.1 | GET/POST/HEAD，状态机解析（跨 TCP 拆包累积），keep-alive / pipelining 保序；Host 头校验（RFC 7230 §5.4）、响应 Date 头（RFC 7231 §7.1.1.2）、`Expect: 100-continue`、URL 解码按 RFC 3986（path 中 `+` 保持字面量，仅 query 做表单解码） |
+| HTTP/1.1 | GET/POST/HEAD，状态机解析（跨 TCP 拆包累积），keep-alive / pipelining 保序；Host 头校验（RFC 7230 §5.4）、响应 Date 头（RFC 7231 §7.1.1.2，每秒缓存省序列化开销）、`Expect: 100-continue`、URL 解码按 RFC 3986（path 中 `+` 保持字面量，仅 query 做表单解码） |
 | 协议安全 | 缺 Host / 重复 Host 冲突 → 400、CL+CL 冲突 → 400、Transfer-Encoding → 501 拒绝、无法满足的 Expect → 417、头部/body 限长 → 413（先于 100-continue） |
 | 路由 | 精确匹配 + 参数化（`/user/:id`）+ 通配符（`*`），URL 解码后匹配 |
 | 静态文件 | sendfile 零拷贝（>64KB）+ LRU 内容缓存（≤64KB）+ realpath 路径穿越防护 + 304 协商缓存；**TOCTOU 加固**：openat2 + RESOLVE_NO_SYMLINKS 关闭校验与 open 之间的竞态窗口，文件 fd 一次打开直传发送层（消除二次 open） |
 | 背压 | 线程池队列满 → 503 **不关连接**（避免"拒绝→重连→更忙"风暴） |
+| 异常隔离 | 三层 try/catch：handler 异常 → 500 响应；逃逸异常记日志不杀线程，在途计数不泄漏（优雅关闭不挂 10s） |
 | 定时器 | timerfd + 自实现最小堆（O(log n) cancel），空闲连接超时 |
 | 优雅关闭 | 信号 → eventfd → 停止 accept → 排空在途请求 → 连接归零退出，10s 兜底 |
 | 可观测性 | 6 个 lock-free atomic 指标 + `/stats` JSON，结构化日志，CLI/配置文件双源配置 |
-| syscall 削减 | eventfd 唤醒去重（`wakeupPending_` 原子）、send 先直接写 EAGAIN 才注册 EPOLLOUT（消除 epoll_ctl 乒乓）、timerfd 惰性重置（1s 心跳扫描替代每请求 cancel/addTimer）。strace 实测 1000 keep-alive 请求：epoll_ctl 11 次、timerfd_settime 5 次（旧实现各 2000/1000 次），每请求 ≈4 次 syscall |
+| syscall 削减 | eventfd 唤醒去重（`wakeupPending_` 原子）、send 先直接写 EAGAIN 才注册 EPOLLOUT（消除 epoll_ctl 乒乓）、timerfd 惰性重置（1s 心跳扫描替代每请求 cancel/addTimer）、Date 头每秒缓存。strace 实测 1000 keep-alive 请求：epoll_ctl 11 次、timerfd_settime 5 次（旧实现各 2000/1000 次），每请求 ≈4 次 syscall |
 
 ## 架构
 
@@ -65,6 +66,8 @@ epoll_wait → Channel → TcpConnection::handleRead (ET 循环读)
 | 大文件 sendfile / 小文件 LRU | >64KB 走零拷贝（内核态 DMA），≤64KB 走内存缓存（省 open/read syscall，实测静态小文件 8 万 req/s） |
 | 503 背压不关连接 | 关连接版会触发客户端"拒绝→重连→更忙"风暴 + 服务端 TIME_WAIT 堆积（实测 3000+） |
 | `addTimer`/`cancel` 断言 IO 线程 | 定时器全生命周期单线程，零锁竞争 |
+| 三层异常隔离 | 单请求异常不得杀死进程：handler 异常转 500，逃逸异常记日志、在途计数不泄漏（否则排空永不收敛）、线程不退出 |
+| Date 头每秒缓存 | RFC 7231 日期粒度是秒，同秒内所有响应复用同一格式化结果，省每响应一次 `gmtime_r`+`strftime`（thread_local 无锁） |
 
 ## 踩坑记录（调试故事）
 
@@ -152,7 +155,7 @@ one-loop-per-thread 后重新压测；c≥1000 多次运行波动 ±5%，表中�
 
 ## 测试与验证
 
-- **单元测试**：64 个用例（`./build/unit_tests` 或 `ctest`）覆盖 HttpContext 解析状态机（拆包逐字节、畸形请求行、CL 冲突、TE 拒绝、Host 校验、Expect、限长）、Router、StaticFileHandler（穿越/符号链接/缓存失效/304）、ThreadPool（RR 分发/在途有界/stop 后投递安全），零第三方依赖
+- **单元测试**：66 个用例（`./build/unit_tests` 或 `ctest`）覆盖 HttpContext 解析状态机（拆包逐字节、畸形请求行、CL 冲突、TE 拒绝、Host 校验、Expect、限长）、Router、StaticFileHandler（穿越/符号链接/缓存失效/304）、ThreadPool（RR 分发/在途有界/异常隔离/stop 后投递安全）、Date 头格式，零第三方依赖
 - **协议/功能**：27 项端到端回归（动态路由 + 协议行为 + 静态文件逐字节 + 短连接关闭时序 + 并发 50×20 + SIGTERM 优雅关闭）全部通过
 - **内存安全**：ASan/UBSan 下 64 单测 + 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零错误
 - **背压**：`--max-queue-size 1` + 200 并发实测触发 503，连接保持无重连风暴
@@ -168,13 +171,13 @@ one-loop-per-thread 后重新压测；c≥1000 多次运行波动 ±5%，表中�
 ## 项目结构
 
 ```
-include/    # 18 个头文件：EventLoop / Channel / Acceptor / TcpConnection /
+include/    # 19 个头文件：EventLoop / Channel / Acceptor / TcpConnection /
             # HttpContext / Buffer / TimerQueue / ThreadPool / Router / ...
 src/        # 对应实现
-test/       # 60 个单元测试（零依赖 TEST_CASE 框架，ctest 接入）
+test/       # 66 个单元测试（零依赖 TEST_CASE 框架，ctest 接入）
 docs/
-├── ARCHITECTURE.md   # 架构详解 + 13 步迭代记录（每个优化对应功能增量）
-└── DESIGN.md         # 逐模块设计决策 + 方案对比 + 底层原理（1119 行）
+├── ARCHITECTURE.md   # 架构详解 + 17 步迭代记录（每个优化对应功能增量）
+└── DESIGN.md         # 逐模块设计决策 + 方案对比 + 底层原理（595 行）
 .github/workflows/ci.yml
 ```
 

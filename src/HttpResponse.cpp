@@ -12,6 +12,23 @@ std::string httpDate(time_t t) {
     return std::string(buf);
 }
 
+// Date 头每秒缓存：RFC 7231 §7.1.1.2 日期粒度是秒，同一秒内所有响应的 Date 头
+// 必须相同。全量响应序列化（headersToString/appendToBuffer）每请求都取一次，
+// 14 万 req/s 下每请求一次 gmtime_r + strftime 是纯浪费（两次系统调用 + locale
+// 处理 ≈ 数百 ns）。
+// thread_local：响应序列化只发生在 IO 线程（deliverResponse），各线程独立缓存
+// 上次格式化的秒值与字符串，无需任何锁；秒边界首次访问才重算，之后直接复用
+const std::string& httpDateNow() {
+    static thread_local time_t cachedSec = 0;
+    static thread_local std::string cached;
+    time_t now = time(nullptr);
+    if (now != cachedSec) {
+        cached = httpDate(now);
+        cachedSec = now;
+    }
+    return cached;
+}
+
 HttpResponse::HttpResponse() : statusCode_(HttpStatusCode::k200Ok)
                              , statusMessage_("OK")
                              , body_()
@@ -78,8 +95,9 @@ void HttpResponse::appendToBuffer(Buffer* buf) const// 序列化成 HTTP 响应�
     std::string statusLine = "HTTP/1.1 " + std::to_string(statusCode_) + " " +statusMessage_ + "\r\n";
     buf->append(statusLine.data(), statusLine.size());
 
-    // Date：RFC 7231 §7.1.1.2 所有响应必须带（与 headersToString 保持一致）
-    std::string dateLine = "Date: " + httpDate(time(nullptr)) + "\r\n";
+    // Date：RFC 7231 §7.1.1.2 所有响应必须带（与 headersToString 保持一致），
+    // 走每秒缓存（httpDateNow），避免每响应一次 gmtime_r + strftime
+    std::string dateLine = "Date: " + httpDateNow() + "\r\n";
     buf->append(dateLine.data(), dateLine.size());
 
     //序列化头
@@ -119,8 +137,9 @@ std::string HttpResponse::headersToString() const // 将响应头部转换为字
     // 状态行
     result += "HTTP/1.1 " + std::to_string(statusCode_) + " " + statusMessage_ + "\r\n";
     // Date：RFC 7231 §7.1.1.2 服务器 MUST 生成。加在唯一序列化汇合点（toString/sendResponse 都走这里），
-    // 保证 200/304/404/413/501/503 所有响应都有，无需各 handler 逐个添加
-    result += "Date: " + httpDate(time(nullptr)) + "\r\n";
+    // 保证 200/304/404/413/501/503 所有响应都有，无需各 handler 逐个添加；
+    // 每秒缓存（httpDateNow）——这是 14 万 req/s 下每请求必走的唯一日期格式化点
+    result += "Date: " + httpDateNow() + "\r\n";
     // 头部
     for (auto& [k, v] : headers_) {
         result += k + ": " + v + "\r\n";

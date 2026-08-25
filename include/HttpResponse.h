@@ -67,5 +67,10 @@ private:
 };
 
 // time_t → HTTP 日期格式（如 "Fri, 22 Aug 2026 08:00:00 GMT"）。
-// 共享实现：RFC 7231 §7.1.1.2 要求所有响应带 Date，序列化时统一生成
+// 共享实现：RFC 7231 §7.1.1.2 要求所有响应带 Date，序列化时统一生成；
+// Last-Modified 等按时间戳格式化的地方直接调用
 std::string httpDate(time_t t);
+
+// Date 头每秒缓存：同一秒内所有响应复用同一格式化结果（HTTP 日期粒度是秒），
+// 消除每响应一次 gmtime_r + strftime。线程本地缓存，无锁。序列化汇合点专用
+const std::string& httpDateNow();

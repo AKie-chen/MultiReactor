@@ -37,7 +37,17 @@ void EventLoop::loop() {
             }
             for(int i=0;i<react;i++){
                 Channel* channel = static_cast<Channel*>(events_[i].data.ptr); // 获取就绪事件对应的Channel对象
-                channel->handleEvent(events_[i].events); // 处理事件，根据事件类型调用相应的回调函数
+                // 异常隔离：单个连接/定时器回调抛异常只影响自己（记日志 + 该连接
+                // 依赖 handleRead/handleWrite 的错误分支自行清理），不得击穿事件
+                // 循环杀死 IO 线程/主线程（std::terminate → 进程崩溃）。
+                // 注意 catch 在循环内：漏掉一个回调不耽误后续就绪事件的处理
+                try {
+                    channel->handleEvent(events_[i].events); // 处理事件，根据事件类型调用相应的回调函数
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "Exception in channel event handler: " << e.what();
+                } catch (...) {
+                    LOG_ERROR << "Unknown exception in channel event handler";
+                }
             }
         }else if(react==0){
             LOG_DEBUG << "epoll_wait timeout, no events";
@@ -64,7 +74,16 @@ void EventLoop::loop() {
             }
             callingPendingFunctors_ = true;
             for (auto& func : temp) {
-                func();
+                // 异常隔离：任务（worker 响应投递/延迟析构守卫/定时器回调）抛异常
+                // 只记日志继续，不能逃出 loop() 杀死线程。callingPendingFunctors_
+                // 复位在 catch 之外——漏抛一个任务不破坏后续 queueInLoop 的唤醒语义
+                try {
+                    func();
+                } catch (const std::exception& e) {
+                    LOG_ERROR << "Exception in pending functor: " << e.what();
+                } catch (...) {
+                    LOG_ERROR << "Unknown exception in pending functor";
+                }
             }
             callingPendingFunctors_ = false;
         }

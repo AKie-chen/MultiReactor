@@ -1,4 +1,5 @@
 #include "ThreadPool.h"
+#include "Log.h"
 
 ThreadPool::ThreadPool(size_t numThreads, size_t maxQueueSize)
     : maxQueueSize_(maxQueueSize)
@@ -47,7 +48,17 @@ bool ThreadPool::tryRun(Task task) // 提交任务，非阻塞
     // tryRun 并发调用；fetch_add 保证每个提交者拿到唯一序号，mod n 后互斥）
     size_t idx = next_.fetch_add(1, std::memory_order_relaxed) % loops_.size();
     loops_[idx]->queueInLoop([this, task = std::move(task)]() mutable {
-        task(); // 在 worker loop 线程执行
+        // 异常隔离（最后一道防线）：业务 handler 的异常已被 main.cpp 的任务
+        // 包装层转成 500，这里兜底保证任何逃逸的异常（含包装层自身的 bug）
+        // 都不会杀死 worker 线程。inFlight_ 必须无条件自减——漏减会让在途
+        // 计数虚高：后续请求误判背压（503），优雅关闭的 drainCheck 永不收敛
+        try {
+            task(); // 在 worker loop 线程执行
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Exception in worker task: " << e.what();
+        } catch (...) {
+            LOG_ERROR << "Unknown exception in worker task";
+        }
         inFlight_.fetch_sub(1, std::memory_order_relaxed);
     });
     return true;
