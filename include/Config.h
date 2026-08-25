@@ -11,11 +11,11 @@ struct ServerConfig{
     bool keepAlive = true; // 是否开启长连接
     size_t maxConnections = 10000; // 最大连接数
     int keepAliveIdleSec = 7200; // 长连接空闲时间(两小时)
-    int maxQueueSize = 1024; // 线程池队列最大长度
+    int maxQueueSize = 1024; // worker 池在途任务上限（排队+执行中）
 
     // 线程
     // 实测最优组合：IO 线程 ≈ 核数，worker 线程 2~3（轻任务下 worker 过多会
-    // 放大线程池锁竞争与 notify_one 空唤醒，见 README 性能节 2026-08 压测数据）
+    // 放大每任务 eventfd 唤醒与缓存竞争，见 README 性能节 2026-08 压测数据）
     size_t ioThreads = 4;
     size_t workerThreads = 2;
 

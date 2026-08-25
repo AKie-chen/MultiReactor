@@ -5,7 +5,7 @@
 
 基于 **epoll ET** 从零实现的多线程 **Reactor 模式** C++17 HTTP 服务器，无任何第三方依赖。
 核心设计参考 muduo（主从 Reactor、one loop per thread、eventfd 唤醒、timerfd 定时器），
-实测动态路由峰值吞吐 **10.1 万 req/s**（4 IO + 2 worker，VM 环境），静态小文件 8 万 req/s。
+实测动态路由峰值吞吐 **14.0 万 req/s**（4 IO + 2 worker，VM 环境），静态小文件 7.5 万 req/s。
 
 > 这是一个以学习为目的、以生产工程标准要求自己的项目：所有关键设计决策都经过
 > 真实压测/ASan/UBSan 验证，每个踩过的坑都记录在代码注释与本文档中。
@@ -15,7 +15,7 @@
 | 类别 | 内容 |
 |------|------|
 | I/O 模型 | epoll **ET** 边缘触发 + 非阻塞 I/O，readv + 64KB extrabuf 循环读，动态扩容 |
-| 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 线程 RR 分发）+ 有界队列工作线程池，eventfd 跨线程唤醒；**请求级并行**：同连接多请求独立提交 worker，seq 有序响应队列按序重排发送 |
+| 并发模型 | 主从 Reactor（主线程 accept + N 个 IO 线程 RR 分发）+ one-loop-per-thread 工作线程池（每 worker 独立 EventLoop，无共享队列，在途计数有界），eventfd 跨线程唤醒；**请求级并行**：同连接多请求独立提交 worker，seq 有序响应队列按序重排发送 |
 | 生命周期 | `shared_ptr` + `queueInLoop` 延迟析构，消除并发下 use-after-free（ASan 验证） |
 | HTTP/1.1 | GET/POST/HEAD，状态机解析（跨 TCP 拆包累积），keep-alive / pipelining 保序；Host 头校验（RFC 7230 §5.4）、响应 Date 头（RFC 7231 §7.1.1.2）、`Expect: 100-continue`、URL 解码按 RFC 3986（path 中 `+` 保持字面量，仅 query 做表单解码） |
 | 协议安全 | 缺 Host / 重复 Host 冲突 → 400、CL+CL 冲突 → 400、Transfer-Encoding → 501 拒绝、无法满足的 Expect → 417、头部/body 限长 → 413（先于 100-continue） |
@@ -33,7 +33,7 @@
 main
 ├── Config / SignalHandler / Logger / Metrics
 ├── Router + StaticFileHandler         # 业务层
-├── ThreadPool                         # 工作线程（有界队列, 满 → 503 背压）
+├── ThreadPool                         # 工作线程（one loop per thread, 在途有界 → 503 背压）
 ├── EventLoop (主线程)                 # accept + 信号 + 定时器
 │   ├── TimerQueue (timerfd 最小堆)
 │   ├── Acceptor (EMFILE 排空)
@@ -107,51 +107,54 @@ wrk -t4 -c100 -d10s --latency http://127.0.0.1:8080/
 ## 性能
 
 测试环境：VMware 虚拟机 4 vCPU @ 3.2GHz（宿主机 Ryzen 7 7735H），4 IO + 2 worker
-（默认配置，2026-08 线程数调整后重新压测），Release，本机回环，wrk 4 线程 10s
-（c≥1000 多次运行波动 ±5%，表中为 2~3 轮平均）。
+（默认配置），Release，本机回环，wrk 4 线程 10s（2026-08 worker 池重构为
+one-loop-per-thread 后重新压测；c≥1000 多次运行波动 ±5%，表中为 2~3 轮平均）。
 
 | 并发连接 | 平均吞吐 (req/s) | P50 | P99 |
 |----------|------------------|-----|-----|
-| 100 | 80,374 | 1.09 ms | 3.53 ms |
-| 500 | 100,949 | 4.34 ms | 12.68 ms |
-| 1000 | **101,223** | 8.66 ms | 21.89 ms |
-| 2000 | 101,585 | 17.65 ms | 38.98 ms |
-| 5000 | 85,245 | 54.98 ms | 103.46 ms |
+| 100 | 129,814 | 0.67 ms | 2.04 ms |
+| 500 | 136,646 | 3.16 ms | 9.24 ms |
+| 1000 | **140,445** | 6.09 ms | 15.15 ms |
+| 2000 | 129,197 | 13.59 ms | 28.07 ms |
+| 5000 | 108,348 | 40.31 ms | 84.96 ms |
 
-> 注：c=2000/5000 时出现约 1% 的 503（线程池队列满的背压响应，设计内行为，见下）。
+> 注：c=2000/5000 时出现约 0.5% 的 503（线程池在途上限 1024 的背压响应，设计内行为，见下）。
 
 | 场景 | 吞吐 (req/s) | P50 | P99 |
 |------|--------------|-----|-----|
-| 动态路由 /user/123（-c1000） | 101,223 | 8.66 ms | 21.89 ms |
-| 静态小文件（LRU 命中，-c100） | 79,560 | 1.12 ms | 2.74 ms |
-| 大文件 300KB（sendfile，-c100） | 19,665 | 4.04 ms | 10.37 ms |
+| 动态路由 /user/123（-c1000） | 140,445 | 6.09 ms | 15.15 ms |
+| 静态小文件（LRU 命中，-c100） | 74,480 | 1.21 ms | 3.34 ms |
+| 大文件 300KB（sendfile，-c100） | 19,096 | 3.72 ms | 9.94 ms |
 
 **诚实的瓶颈分析**（完整数据与推导见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)）：
 
-- **线程数是压测出来的，不是拍脑袋定的**：2026-08 对 4 核机器做 IO/worker 全组合
-  扫描——4+4（旧默认）6.0 万 → 2+2 8.0 万 → 3+2 9.2 万 → **4+2 10.1 万 req/s**；
-  2+2 加 worker 到 2+3 反而降到 6.4 万。原因：任务极轻（微秒级）时 worker 过多
-  放大线程池锁竞争与 notify_one 空唤醒（4+4 压测期间上下文切换 25.3 万次，
-  2+2 仅 15.7 万次），而 IO 线程是请求生命周期的主线，越多越平。
-  规则：**IO ≈ 核数，worker 取 2~3**（多核机器需重测）
-- 当前吞吐平台 ≈10.1 万 req/s，恰好 ≈ **2 个 worker × ~5 万 tasks/s** 的消费速率：
-  平台由线程池吞吐决定，而非 CPU（4 vCPU 理论峰值 ≈ 19.7 万，达成率 51%）。
-  c=2000/5000 的 503 即提交突发溢出 1024 队列的背压。突破平台的方向：
-  空队列快路径（IO 线程直执行，砍掉跨线程 handoff），或按并发档位调
-  `max_queue_size` / `worker_threads`
+- **worker 池重构：共享队列 → one-loop-per-thread，-c1000 动态路由 +39%**：
+  2026-08 将 ThreadPool 从"单共享队列 + mutex/condvar"改为"N 个 worker 各自运行
+  独立 EventLoop，RR 分发 + eventfd 唤醒"——提交路径只剩两个原子操作（fetch_add
+  在途计数 + RR 取模），无共享队列、无锁竞争、无 notify_one 空唤醒。同配置
+  （4 IO + 2 worker）同档位对比：-c1000 101.2k → **140.4k**（+39%），-c100
+  80.4k → 129.8k（+62%），P50 8.66 → 6.09 ms；503 比例从 1.2% 降至 0.5%；
+  静态小文件基本持平（79.6k → 74.5k，-6% 在测量噪声边缘）
+- **线程数结论不变**：重构后重扫 4+4（新架构，-c1000 98.3k），仍显著低于 4+2
+  的 140.4k——4 核上 worker 过多只是超订抢占，与锁实现无关；规则仍为
+  **IO ≈ 核数，worker 取 2~3**（多核机器需重测）
+- 当前吞吐平台 ≈14 万 req/s，由 2 个 worker 各自的 loop 消费速率决定（每 worker
+  ~7 万 tasks/s），而非 CPU（4 vCPU 理论峰值 ≈ 19.7 万，达成率 71%）。
+  c=2000/5000 的 503 即突发提交溢出 1024 在途上限的背压。继续突破的方向：
+  空队列快路径（IO 线程直执行，砍掉跨线程 handoff）、调大 `max_queue_size`
 - syscall 削减效果（历史记录，4+4 配置下测得）：削减前每请求 7 次系统调用
   （readv / send / epoll_ctl×2 / timerfd_settime / eventfd×2），削减后 ≈4 次；
   c=100 动态路由 48.5k→52.9k（+9%）、静态小文件 67.4k→80.4k（+19%，
   P50 1.30→1.06 ms）
-- 延迟随并发近似线性（1000 连接 × 8.7 ms ≈ 11.4 万，与 Little's law 量级一致）
+- 延迟随并发近似线性（1000 连接 × 6.1 ms ≈ 16 万，与 Little's law 量级一致）
 - c≥1000 三次复测波动 ±10%（VM 调度噪声）；请求级并行的单连接流水线收益需专用
   流水线压测工具量化（wrk 单连接不并发，现有多连接数据反映的是聚合吞吐）
 
 ## 测试与验证
 
-- **单元测试**：60 个用例（`./build/unit_tests` 或 `ctest`）覆盖 HttpContext 解析状态机（拆包逐字节、畸形请求行、CL 冲突、TE 拒绝、Host 校验、Expect、限长）、Router、StaticFileHandler（穿越/符号链接/缓存失效/304），零第三方依赖
+- **单元测试**：64 个用例（`./build/unit_tests` 或 `ctest`）覆盖 HttpContext 解析状态机（拆包逐字节、畸形请求行、CL 冲突、TE 拒绝、Host 校验、Expect、限长）、Router、StaticFileHandler（穿越/符号链接/缓存失效/304）、ThreadPool（RR 分发/在途有界/stop 后投递安全），零第三方依赖
 - **协议/功能**：27 项端到端回归（动态路由 + 协议行为 + 静态文件逐字节 + 短连接关闭时序 + 并发 50×20 + SIGTERM 优雅关闭）全部通过
-- **内存安全**：ASan/UBSan 下 60 单测 + 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零错误
+- **内存安全**：ASan/UBSan 下 64 单测 + 300 并发混合畸形流量（并发 + 错误请求 + 静态文件）零错误
 - **背压**：`--max-queue-size 1` + 200 并发实测触发 503，连接保持无重连风暴
 - **优雅关闭**：SIGTERM 压测中在途大文件响应完整送达（逐字节校验）、活跃连接归零后 0.1s 内退出
 - **CI**：GitHub Actions，gcc/clang × Release/Debug 四组矩阵构建 + 冒烟测试

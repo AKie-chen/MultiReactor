@@ -334,13 +334,15 @@ int main(int argc, char* argv[]) {
              << ", worker threads:" << cfg.workerThreads;
     loop.loop();
     // 拆除顺序（两个 ASAN 实测崩溃都出在这三步的顺序上）：
-    // 1) threadPool.stop()：join 所有 worker。worker 任务里 conn->getLoop()->
-    //    queueInLoop() 还引用子循环，所以子循环此刻必须还活着
+    // 1) threadPool.stop()：quit 所有 worker loop + join 线程。worker 任务里
+    //    conn->getLoop()->queueInLoop() 还引用子循环，所以子循环此刻必须还活着。
+    //    stop 只 quit+join，loops_ 存活到析构——即使 deadline 兜底时还有活跃
+    //    连接、IO 线程继续 tryRun，投递也落进存活队列（永不执行），不变式保持
     // 2) server.shutdown()：子循环 quit+join、连接全部关闭。这一步必须赶在
     //    ~ThreadPool（函数返回后执行）之前——否则还活着的子循环线程会通过
-    //    messageCallback → threadPool.tryRun 往即将释放的 tasks_ deque 里
-    //    投递任务（ASAN 实测 heap-use-after-free WRITE，ThreadPool.cpp:35）
-    // 3) 函数返回后 ~threadPool 才真正释放任务队列——此时所有投递方已死
+    //    messageCallback → threadPool.tryRun 往即将释放的 pendingFunctors_ 里
+    //    投递任务（ASAN 实测 heap-use-after-free WRITE）
+    // 3) 函数返回后 ~threadPool 才释放 loops_（关闭 epoll/eventfd fd）——此时所有投递方已死
     threadPool.stop();
     server.shutdown();
     return 0;

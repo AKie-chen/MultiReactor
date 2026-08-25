@@ -12,7 +12,7 @@ main
 ├── Metrics (6 个 atomic 计数器, lock-free)
 ├── Router (精确路由: method + path → handler)
 ├── StaticFileHandler (磁盘文件服务 + 路径穿越防护)
-├── ThreadPool (2 线程, 默认配置, 请求处理)
+├── ThreadPool (one loop per thread, 2 worker, 默认配置, 请求处理)
 ├── EventLoop (主线程, accept + 信号 + 定时器)
 │   ├── TimerQueue (timerfd + 自实现最小堆, 连接超时管理)
 │   ├── TcpServer
@@ -30,8 +30,9 @@ epoll_wait → Channel::handleEvent
       → Metrics::bytesReceived
         → HttpContext::parseRequest (状态机 + 错误分类)
           → Metrics::totalRequests++
-            → ThreadPool::tryRun (工作线程, 有界队列满 → 503 背压)
-              → Router::route (精确匹配)
+            → ThreadPool::tryRun (RR 分发到 worker EventLoop, 在途满 → 503 背压)
+              → EventLoop::queueInLoop (投递到 worker loop)
+                → Router::route (精确匹配)
               → StaticFileHandler::handle (fallback, realpath 防穿越)
                 → HttpResponse 构造 + 错误码统计
                   → EventLoop::queueInLoop (切回 I/O 线程)
@@ -54,7 +55,7 @@ epoll_wait → Channel::handleEvent
 | 配置 | CLI + key=value 配置文件, 两遍扫描 (CLI 优先) |
 | 安全 | 请求头限长 (8KB/行, 64KB 累计 → 413), 连接数上限, 503 背压 |
 | 指标 | 6 个 atomic 计数器, /stats JSON 端点, lock-free |
-| 多线程 | 主从 Reactor + 线程池, eventfd 跨线程唤醒 |
+| 多线程 | 主从 Reactor + one-loop-per-thread worker 池, eventfd 跨线程唤醒 |
 | 协议 | HTTP/1.1, 支持 curl/ab/wrk |
 
 ## 快速开始
@@ -123,9 +124,10 @@ wrk -t4 -c100 -d30s http://127.0.0.1:8080/
 
 测试环境: 4 IO + 2 worker 线程, Release 编译, 本机回环, wrk 4 线程 10s, 动态路由 `/user/123`。
 
-> 注：本节数据为 2026-08 默认配置调整（4 IO + 4 worker → 4 IO + 2 worker）前的历史测量。
-> 当前默认配置下动态路由峰值 ≈10.1 万 req/s（-c1000，wrk --latency），线程组合扫描与
-> 瓶颈分析见 [README 性能节](../README.md)。
+> 注：本节数据为 2026-08 前的历史测量（4 IO + 4 worker、共享队列线程池）。
+> 当前默认配置（4 IO + 2 worker、one-loop-per-thread worker 池）下动态路由峰值
+> ≈14.0 万 req/s（-c1000，wrk --latency），线程组合扫描与瓶颈分析见
+> [README 性能节](../README.md)。
 
 ### 吞吐量 vs 并发度
 
@@ -196,7 +198,7 @@ MultiReactor/
 │   ├── StaticFileHandler.h     # 静态文件 + LRU 缓存 + 路径穿越防护
 │   ├── TcpConnection.h         # 连接生命周期管理
 │   ├── TcpServer.h             # 服务器入口 + 连接计数
-│   ├── ThreadPool.h            # 工作线程池 (有界队列)
+│   ├── ThreadPool.h            # 工作线程池 (one loop per thread, 在途有界)
 │   ├── Timer.h                 # 定时器对象
 │   └── TimerQueue.h            # timerfd 定时器队列
 ├── src/

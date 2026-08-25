@@ -17,9 +17,9 @@ private:
     std::mutex mutex_; // 互斥锁，用于保护共享数据
     std::thread::id threadId_; // 事件循环所在的线程ID
     std::vector<epoll_event> events_; // 就绪事件数组
-    std::vector<std::function<void()>> pendingFunctors_;//销毁Channel指针的队列
+    std::vector<std::function<void()>> pendingFunctors_;// 待执行的任务队列
     TimerQueue timerQueue_; // 定时器队列对象，用于管理定时器事件
-    bool callingPendingFunctors_ = false; //判断是否进入销毁队列
+    bool callingPendingFunctors_ = false; //判断是否进入任务队列
     std::atomic<bool> wakeupPending_ = false; //判断是否需要唤醒
     
 public:
