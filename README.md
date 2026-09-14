@@ -215,12 +215,11 @@ Release，本机回环，wrk 8 线程 10s；动态路由用 `-i 8 -w 1`，静态
 include/    # 19 个头文件：EventLoop / Channel / Acceptor / TcpConnection /
             # HttpContext / Buffer / TimerQueue / ThreadPool / Router / ...
 src/        # 对应实现
-test/       # 66 个单元测试（零依赖 TEST_CASE 框架，ctest 接入）
+test/       # 66 个单元测试（零依赖 TEST_CASE 框架）+ e2e.py（37 项端到端回归），均接入 ctest
 bench/      # 性能测试脚本 + 实测数据（开环延迟扫描 / 流水线基准 / 拆包测试）
 docs/
 ├── ARCHITECTURE.md   # 架构详解 + 17 步迭代记录（每个优化对应功能增量）
 └── DESIGN.md         # 逐模块设计决策 + 方案对比 + 底层原理（595 行）
-.github/workflows/ci.yml
 ```
 
 ## License

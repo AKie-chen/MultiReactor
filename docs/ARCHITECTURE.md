@@ -221,11 +221,10 @@ MultiReactor/
 │   ├── Timer.h                 # 定时器对象
 │   └── TimerQueue.h            # timerfd + 自实现最小堆
 ├── src/       # 对应实现 + main.cpp（路由注册/排空状态机）
-├── test/      # 66 个单元测试（零依赖 TEST_CASE 框架，ctest 接入）
+├── test/      # 66 个单元测试（零依赖 TEST_CASE 框架）+ e2e.py（37 项端到端回归）
 ├── docs/
 │   ├── ARCHITECTURE.md         # 本文档（架构 + 17 步迭代记录）
 │   └── DESIGN.md               # 逐模块设计决策 + 方案对比 + 底层原理
-├── .github/workflows/ci.yml    # CI (gcc/clang × Release/Debug)
 ├── CMakeLists.txt
 └── LICENSE
 ```
