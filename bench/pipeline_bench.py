@@ -9,12 +9,20 @@
 id 用 4 位定长（1000..）→ 所有响应等长，热路径按步长切片校验；
 末了用服务端 /stats 的请求计数交叉验证客户端计数，防止客户端自身算错。
 
-用法: pipeline_bench.py <conns> <depth> <duration_s>
-示例: python3 bench/pipeline_bench.py 128 64 5
-"""
-import socket, sys, time, json, threading, urllib.request
+多进程：procs>1 时按连接 fork 子进程（各自独立 GIL）。Python 单进程每请求约
+7µs CPU，单进程跑不满高核数服务端——4 vCPU 上 procs=1 够用，核数上去后 procs
+要跟着涨。起止用绝对 deadline 对齐，子进程结果经管道回传后在父进程聚合；
+父进程只负责发令与统计，不计入客户端 CPU。
 
-HOST, PORT = "127.0.0.1", 8080
+用法: pipeline_bench.py <conns> <depth> <duration_s> [procs]
+      BENCH_HOST=10.0.0.5 BENCH_PORT=8080 python3 bench/pipeline_bench.py 16 256 10 4
+示例: python3 bench/pipeline_bench.py 16 256 5      # 单进程
+      python3 bench/pipeline_bench.py 32 128 10 4   # 4 进程
+"""
+import socket, sys, time, json, os, threading, traceback, urllib.request
+
+HOST = os.environ.get("BENCH_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BENCH_PORT", "8080"))
 ID_BASE = 1000  # 4 位定长 id，保证响应等长
 
 
@@ -116,24 +124,97 @@ def run_conn(depth, deadline, stride, body_off, results, idx):
     results[idx] = {"req": n_req, "503": n_503, "bad": n_bad, "lat": lat}
 
 
-def bench(conns, depth, duration):
-    stride, body_off = probe_stride()
-    r0 = stats_requests()
-    t0 = time.monotonic(); deadline = t0 + duration
+def run_conns(conns, depth, deadline, stride, body_off):
+    """跑 conns 条连接直到 deadline，返回该组连接的聚合结果。"""
     results = [None] * conns
     threads = [threading.Thread(target=run_conn, args=(depth, deadline, stride, body_off, results, i))
                for i in range(conns)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return {
+        "req": sum(r["req"] for r in results),
+        "bad": sum(r["bad"] for r in results),
+        "n503": sum(r["503"] for r in results),
+        "lat": [x for r in results for x in r["lat"]],
+        "errs": [r["err"] for r in results if "err" in r],
+    }
+
+
+def write_all(fd, data):
+    mv = memoryview(data)
+    while mv:
+        mv = mv[os.write(fd, mv):]
+
+
+def fork_child(conns, depth, deadline, stride, body_off):
+    """fork 一个子进程跑 conns 条连接，返回 (pid, 读端 fd)。"""
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        try:
+            blob = json.dumps(run_conns(conns, depth, deadline, stride, body_off)).encode()
+        except BaseException:
+            blob = json.dumps({"fatal": traceback.format_exc()}).encode()
+        try:
+            write_all(wfd, blob)
+        finally:
+            os._exit(0)
+    os.close(wfd)
+    return pid, rfd
+
+
+def read_all(fd):
+    chunks = []
+    while True:
+        b = os.read(fd, 1 << 20)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(fd)
+    return b"".join(chunks)
+
+
+def bench(conns, depth, duration, procs=1):
+    procs = max(1, min(procs, conns))
+    if procs > (os.cpu_count() or 1):
+        print(f"注意: procs={procs} > 可用核 {os.cpu_count()}，压测端自身会互相抢核", file=sys.stderr)
+    stride, body_off = probe_stride()
+    r0 = stats_requests()
+    t0 = time.monotonic()
+    deadline = t0 + duration
+    parts = []
+    if procs == 1:
+        parts.append(run_conns(conns, depth, deadline, stride, body_off))
+    else:
+        kids = []
+        for i in range(procs):
+            n = conns // procs + (1 if i < conns % procs else 0)
+            kids.append(fork_child(n, depth, deadline, stride, body_off))
+        for pid, rfd in kids:
+            blob = read_all(rfd)
+            os.waitpid(pid, 0)
+            if not blob:
+                print("子进程异常退出（无输出）", file=sys.stderr)
+                sys.exit(1)
+            part = json.loads(blob)
+            if "fatal" in part:
+                print(part["fatal"], file=sys.stderr)
+                sys.exit(1)
+            parts.append(part)
     elapsed = time.monotonic() - t0
     r1 = stats_requests()
-    total = sum(r["req"] for r in results)
-    bad = sum(r["bad"] for r in results)
-    n503 = sum(r["503"] for r in results)
-    lats = sorted(x for r in results for x in r["lat"])
-    errs = [r["err"] for r in results if "err" in r]
+    total = sum(p["req"] for p in parts)
+    bad = sum(p["bad"] for p in parts)
+    n503 = sum(p["n503"] for p in parts)
+    lats = sorted(x for p in parts for x in p["lat"])
+    errs = [e for p in parts for e in p["errs"]]
     pct = lambda p: lats[min(len(lats) - 1, int(len(lats) * p))] if lats else 0.0
-    print(f"conns={conns:<3} depth={depth:<4} client_rps={total/elapsed:>9.0f} "
+    print(f"conns={conns:<3} depth={depth:<4} "
+          + (f"procs={procs} " if procs > 1 else "")
+          + f"client_rps={total/elapsed:>9.0f} "
           f"server_rps={(r1-r0)/elapsed:>9.0f} 503={n503:<8} mismatch={bad:<7} "
           f"batch_p50={pct(.50)*1e3:>8.3f}ms batch_p99={pct(.99)*1e3:>9.3f}ms "
           f"per_req_p50={pct(.50)/depth*1e6:>7.1f}us"
@@ -141,4 +222,5 @@ def bench(conns, depth, duration):
 
 
 if __name__ == "__main__":
-    bench(int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]))
+    bench(int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]),
+          int(sys.argv[4]) if len(sys.argv) > 4 else 1)
