@@ -104,7 +104,13 @@ max_connections = 10000   # 连接数上限, 仅配置文件支持
 ### 测试
 
 ```bash
-# 功能验证
+# 自动化测试（推荐）：单测 + 端到端回归，一条命令跑完
+ctest --test-dir build
+
+# 只跑端到端（自动起停服务端、自建静态夹具、逐字节校验）
+python3 test/e2e.py
+
+# 手工功能验证
 curl -v http://localhost:8080/           # 路由 → Hello, World!
 curl http://localhost:8080/user/42       # 200 参数路由
 curl http://localhost:8080/stats         # 指标 JSON
